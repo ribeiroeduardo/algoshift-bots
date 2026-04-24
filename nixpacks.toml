@@ -1,0 +1,2 @@
+# Root package.json makes Nixpacks pick Node only; add Python for the Railway worker image.
+providers = ["...", "python"]

@@ -4,7 +4,7 @@
       "builder": "NIXPACKS"
     },
     "deploy": {
-      "startCommand": "PYTHONUNBUFFERED=1 python3 railway/engine.py",
+      "startCommand": "bash railway/boot.sh",
       "restartPolicyType": "ON_FAILURE",
       "restartPolicyMaxRetries": 10
     }

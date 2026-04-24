@@ -1,0 +1,4 @@
+# Root file so Nixpacks installs Python (repo has package.json; worker deps live here too).
+supabase==2.3.0
+ccxt==4.1.80
+python-dotenv==1.0.0
