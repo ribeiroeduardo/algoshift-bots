@@ -40,13 +40,6 @@ load_dotenv()
 _trace("module loaded, dotenv applied")
 
 
-def _require_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise RuntimeError(f"missing env: {name}")
-    return v
-
-
 def _resolve_env(label: str, *keys: str) -> str:
     for k in keys:
         v = os.getenv(k)
@@ -73,6 +66,16 @@ def _supabase_key() -> str:
     )
 
 
+def _optional_env(label: str, *keys: str) -> str | None:
+    for k in keys:
+        v = os.getenv(k)
+        if v and str(v).strip():
+            _trace(f"{label}: using env key {k}")
+            return v.strip()
+    _trace(f"{label}: none set (tried {', '.join(keys)})")
+    return None
+
+
 class RailwayTradingEngine:
     def __init__(self):
         _trace("RailwayTradingEngine.__init__ start")
@@ -83,13 +86,29 @@ class RailwayTradingEngine:
         self.supabase: Client = create_client(url, key)
         _trace("supabase client OK")
 
-        # Conexão Bybit (via CCXT)
+        # Bybit (CCXT): same VITE_* demo names as local .env
         _trace("creating ccxt bybit")
-        self.exchange = ccxt.bybit({
-            "apiKey": os.getenv("BYBIT_API_KEY"),
-            "secret": os.getenv("BYBIT_API_SECRET"),
-            "enableRateLimit": True,
-        })
+        bybit_key = _optional_env(
+            "Bybit apiKey",
+            "BYBIT_API_KEY",
+            "VITE_BYBIT_API_KEY",
+            "BYBIT_API_KEY_DEMO",
+            "VITE_BYBIT_API_KEY_DEMO",
+        )
+        bybit_secret = _optional_env(
+            "Bybit secret",
+            "BYBIT_API_SECRET",
+            "VITE_BYBIT_API_SECRET",
+            "BYBIT_API_SECRET_DEMO",
+            "VITE_BYBIT_API_SECRET_DEMO",
+        )
+        self.exchange = ccxt.bybit(
+            {
+                "apiKey": bybit_key or "",
+                "secret": bybit_secret or "",
+                "enableRateLimit": True,
+            }
+        )
         _trace("ccxt bybit OK")
         
         self.active_version_id = None
