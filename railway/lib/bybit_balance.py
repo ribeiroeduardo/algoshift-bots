@@ -53,7 +53,7 @@ def _build_exchange_sync() -> Any | None:
             "apiKey": key,
             "secret": sec,
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
+            "options": {"defaultType": "swap"},
         }
     )
     use_demo = _env_flag("BYBIT_USE_DEMO")

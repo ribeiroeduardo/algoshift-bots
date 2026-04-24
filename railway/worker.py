@@ -95,6 +95,14 @@ class StrategyWorker:
         self.ohlcv_timeframe = "15m"  # set in reload() from params / strategy BASE_TF / env
         self._ohlcv_hint: str | None = None
         self._warned_no_bybit: bool = False
+        self._log_until: dict[str, float] = {}
+
+    def _warn_throttled(self, key: str, interval: float, fmt: str, *args: object) -> None:
+        now = time.monotonic()
+        if now < self._log_until.get(key, 0.0):
+            return
+        self._log_until[key] = now + interval
+        logger.warning(fmt, *args)
 
     async def reload(self) -> None:
         r = (
@@ -146,7 +154,24 @@ class StrategyWorker:
                 await self.reload()
                 cur = self.bot_row.get("status") if self.bot_row else None
                 if prev and cur and prev != cur:
-                    logger.info("status %s -> %s", prev, cur)
+                    le = (self.bot_row or {}).get("last_error")
+                    la = (self.bot_row or {}).get("last_error_at")
+                    if (cur or "").lower() == "error":
+                        logger.error(
+                            "bot DB status %s -> %s last_error_at=%s last_error=%s",
+                            prev,
+                            cur,
+                            la,
+                            (str(le)[:1500] if le else ""),
+                        )
+                    else:
+                        logger.info(
+                            "bot DB status %s -> %s (last_error_at=%s snippet=%s)",
+                            prev,
+                            cur,
+                            la,
+                            (str(le)[:400] if le else ""),
+                        )
             except Exception as e:  # noqa: BLE001
                 logger.exception("reload: %s", e)
             await asyncio.sleep(5.0)
@@ -187,9 +212,23 @@ class StrategyWorker:
             logger.debug("stale %dms", lat)
             return
         if self.hub_status != "healthy" and self.hub_status is not None:
+            self._warn_throttled(
+                "hub_unhealthy",
+                25.0,
+                "[tick_blocked] hub_status=%s — ticks/signals paused until hub is healthy",
+                self.hub_status,
+            )
             return
         st = (self.bot_row or {}).get("status")
         if st != "running":
+            le = (self.bot_row or {}).get("last_error")
+            self._warn_throttled(
+                f"bot_status_{st}",
+                25.0,
+                "[tick_blocked] bot DB status=%r (need 'running'). last_error=%s",
+                st,
+                (str(le)[:500] if le else ""),
+            )
             return
         if not self.strategy:
             return
@@ -318,6 +357,10 @@ class StrategyWorker:
             sig["signal_id"],
             ORDER_OUTCOMES,
         )
+        try:
+            logger.info("SIGNAL_PAYLOAD %s", json.dumps(sig, default=str))
+        except Exception:  # noqa: BLE001
+            logger.info("SIGNAL_PAYLOAD (repr) %r", sig)
 
     async def mark_error(self, err: str) -> None:
         def _m():
@@ -329,10 +372,15 @@ class StrategyWorker:
                 }
             ).eq("id", self.bot_id).execute()
 
+        logger.error(
+            "WORKER_MARK_BOT_ERROR bot_id=%s — writing bots.status=error to Supabase. reason=%s",
+            self.bot_id,
+            str(err)[:2000],
+        )
         try:
             await asyncio.to_thread(_m)
         except Exception as e:  # noqa: BLE001
-            logger.warning("mark_error: %s", e)
+            logger.warning("mark_error Supabase update failed: %s", e)
 
     async def hb_loop(self) -> None:
         inst = os.getenv("RAILWAY_REPLICA_ID", "local")
@@ -374,17 +422,37 @@ class StrategyWorker:
             return
         if str(d.get("bot_id") or "") != str(self.bot_id):
             return
+        try:
+            full = json.dumps(d, default=str)
+        except Exception:  # noqa: BLE001
+            full = str(d)
+        if len(full) > 4000:
+            full = full[:4000] + "…"
+        logger.info("HUB_ORDER_OUTCOME_DETAIL %s", full)
         ok = d.get("ok")
         stage = d.get("stage")
-        msg = d.get("message", "")
-        sig = d.get("signal_id", "")
-        logger.info(
-            "HUB_ORDER_OUTCOME ok=%s stage=%s signal_id=%s %s",
-            ok,
-            stage,
-            sig,
-            (msg or "")[:300],
+        warn_stages = (
+            "exchange",
+            "balance_check",
+            "max_order_size",
+            "no_price",
+            "bot_not_running",
+            "unknown_bot",
+            "max_notional",
+            "max_open_positions",
+            "bad_amount",
+            "invalid_amount",
+            "empty_pair",
+            "exchange_ok_db_fail",
         )
+        if ok is False or str(stage or "").lower() in warn_stages:
+            logger.warning(
+                "HUB_ORDER_OUTCOME_SUMMARY ok=%s stage=%s signal_id=%s message=%s",
+                ok,
+                stage,
+                d.get("signal_id"),
+                str(d.get("message", ""))[:800],
+            )
         strat = self.strategy
         if strat is None:
             return
@@ -422,8 +490,21 @@ class StrategyWorker:
             raw = await self._q_status.get()
             try:
                 o = json.loads(raw)
-                self.hub_status = o.get("status", "healthy")
-                logger.info("hub:status %s", self.hub_status)
+                new_status = o.get("status", "healthy")
+                prev_h = self.hub_status
+                if new_status != prev_h:
+                    logger.info(
+                        "hub:status %s → %s reason=%s published_at_ms=%s",
+                        prev_h,
+                        new_status,
+                        o.get("reason", ""),
+                        o.get("published_at_ms"),
+                    )
+                    try:
+                        logger.info("hub:status_payload %s", json.dumps(o, default=str)[:800])
+                    except Exception:  # noqa: BLE001
+                        pass
+                self.hub_status = new_status
             except Exception:  # noqa: BLE001
                 pass
 

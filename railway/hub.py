@@ -47,6 +47,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hub")
 
+
+def _json_safe_diag(d: dict | None) -> dict | None:
+    """Small JSON-friendly dict for order_outcomes + logs (truncate long strings)."""
+    if not d:
+        return None
+    out: dict[str, Any] = {}
+    for k, v in d.items():
+        ks = str(k)[:80]
+        if isinstance(v, (bool, int, float)) or v is None:
+            out[ks] = v
+        else:
+            s = str(v)
+            out[ks] = s[:800] + ("…" if len(s) > 800 else "")
+    return out
+
+
 STALE_S = 30.0
 SIG_TTL = 300.0
 MAX_SEEN = 10_000
@@ -383,8 +399,14 @@ class _Hub:
         s: dict = {}
         bot: dict | None = None
 
-        async def reply(ok: bool, stage: str, message: str, order: dict | None = None) -> None:
-            p: dict = {
+        async def reply(
+            ok: bool,
+            stage: str,
+            message: str,
+            order: dict | None = None,
+            diag: dict[str, Any] | None = None,
+        ) -> None:
+            p: dict[str, Any] = {
                 "ok": ok,
                 "stage": stage,
                 "message": (message or "")[:2000],
@@ -407,23 +429,40 @@ class _Hub:
                     p["order_status"] = st_o
                 if order.get("filled") is not None:
                     p["filled"] = order.get("filled")
+            slim = _json_safe_diag(diag)
+            if slim:
+                p["diag"] = slim
             await self._publish_order_outcome(p)
+            logger.info(
+                "OUTCOME_SUMMARY bot=%s signal=%s ok=%s stage=%s msg=%s diag=%s",
+                p.get("bot_id"),
+                p.get("signal_id"),
+                ok,
+                stage,
+                (message or "")[:500],
+                slim,
+            )
 
         try:
             parsed = json.loads(raw)
             if not isinstance(parsed, dict):
                 raise TypeError("signal is not an object")
             s = parsed
-        except Exception:  # noqa: BLE001
-            logger.warning("dropped: bad json")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("dropped: bad json (%s) raw_prefix=%s", e, (raw or "")[:200])
             return
         sid = s.get("signal_id")
         if not sid:
-            logger.warning("dropped: no signal_id")
+            logger.warning("dropped: no signal_id keys=%s", list(s.keys())[:20])
             return
         if not self._take_id(str(sid)):
             logger.info("duplicate signal ignored: %s", sid)
-            await reply(False, "duplicate", "hub dedupe: this signal_id was already handled")
+            await reply(
+                False,
+                "duplicate",
+                "hub dedupe: this signal_id was already handled",
+                diag={"signal_id": sid, "bot_id_hint": s.get("bot_id")},
+            )
             return
         self._bump_rate(str(s.get("bot_id", "")))
         logger.info(
@@ -437,7 +476,12 @@ class _Hub:
         bot = await self._get_bot(s.get("bot_id"))
         if not bot:
             logger.warning("unknown bot %s", s.get("bot_id"))
-            await reply(False, "unknown_bot", "no row in public.bots for bot_id")
+            await reply(
+                False,
+                "unknown_bot",
+                "no row in public.bots for bot_id",
+                diag={"requested_bot_id": s.get("bot_id"), "signal_id": sid},
+            )
             return
         st = (bot.get("status") or "").lower()
         if st != "running":
@@ -446,6 +490,11 @@ class _Hub:
                 False,
                 "bot_not_running",
                 f"hub only executes when bot status is 'running' (got {st!r})",
+                diag={
+                    "db_status": st,
+                    "bot_id": str(bot.get("id")),
+                    "bot_name": bot.get("name"),
+                },
             )
             return
 
@@ -453,23 +502,38 @@ class _Hub:
             amt = float(s["amount"])
         except (TypeError, KeyError, ValueError):
             logger.warning("bad amount")
-            await reply(False, "bad_amount", "missing or invalid amount on signal")
+            await reply(
+                False,
+                "bad_amount",
+                "missing or invalid amount on signal",
+                diag={"raw_amount": s.get("amount"), "amount_type": type(s.get("amount")).__name__},
+            )
             return
         caps = parse_bot_params(bot.get("params"))
         mx = float(caps.get("max_order_size") or 0)
         if amt <= 0:
             logger.warning("amount <= 0")
-            await reply(False, "invalid_amount", "amount must be > 0")
+            await reply(False, "invalid_amount", "amount must be > 0", diag={"amount": amt})
             return
         if mx > 0 and amt > mx:
             logger.warning("amount %s > params.max_order_size %s", amt, mx)
             await self._mark_error(bot["id"], f"invalid amount {amt}")
-            await reply(False, "max_order_size", f"amount {amt} > params.max_order_size {mx}")
+            await reply(
+                False,
+                "max_order_size",
+                f"amount {amt} > params.max_order_size {mx}",
+                diag={"amount": amt, "max_order_size": mx},
+            )
             return
         pair = normalize_trading_pair(str(s.get("pair", "") or ""))
         if not pair:
             logger.warning("dropped: empty pair")
-            await reply(False, "empty_pair", "signal.pair is empty")
+            await reply(
+                False,
+                "empty_pair",
+                "signal.pair is empty",
+                diag={"raw_pair": s.get("pair")},
+            )
             return
         mt_bot = (bot.get("market_type") or "linear").lower()
         if mt_bot not in ("spot", "linear", "inverse"):
@@ -483,6 +547,11 @@ class _Hub:
                 False,
                 "no_price",
                 f"hub has no last price for {pair!r} (stale feed or refetch failed); cannot size order",
+                diag={
+                    "pair": pair,
+                    "market_type": mt_bot,
+                    "cached_last_prices_pairs": list(self.last_prices.keys())[:30],
+                },
             )
             return
         notional = amt * float(lp)
@@ -493,6 +562,7 @@ class _Hub:
                 False,
                 "max_notional",
                 f"notional {notional:.2f} > params.max_notional_usd {mnot}",
+                diag={"notional_usd": notional, "max_notional_usd": mnot, "ref_price": float(lp), "amount": amt},
             )
             return
 
@@ -505,14 +575,22 @@ class _Hub:
                 False,
                 "max_open_positions",
                 f"open trades={oc} >= params.max_open_positions={mpos}",
+                diag={"open_trades": oc, "max_open_positions": mpos, "action": act},
             )
             return
 
-        ok, why = await self._balance_check(pair, s.get("action", ""), amt, float(lp), mt_bot)
+        ok, why, bdiag = await self._balance_check(pair, s.get("action", ""), amt, float(lp), mt_bot)
         if not ok:
-            logger.warning("balance check fail: %s", why)
-            await reply(False, "balance_check", why)
+            logger.warning("balance check fail: %s diag=%s", why, bdiag)
+            merged = {**(bdiag or {}), "notional_usd": notional, "ref_price": float(lp), "pair": pair}
+            await reply(False, "balance_check", why, diag=merged)
             return
+
+        ccxt_sym = ""
+        try:
+            ccxt_sym = display_pair_to_ccxt_or_raise(pair, mt_bot)
+        except Exception as e:  # noqa: BLE001
+            ccxt_sym = f"<map_error:{e}>"
 
         try:
             o = await self._exec_order(s, float(lp), mt_bot)
@@ -520,7 +598,18 @@ class _Hub:
             logger.exception("order failed: %s", e)
             await self._mark_error(bot["id"], f"exec: {e}")
             await self._ins_trade_rej(bot, s, str(e))
-            await reply(False, "exchange", str(e))
+            await reply(
+                False,
+                "exchange",
+                str(e),
+                diag={
+                    "exception_type": type(e).__name__,
+                    "ccxt_symbol": ccxt_sym,
+                    "ref_price": float(lp),
+                    "notional_usd": notional,
+                    "amount": amt,
+                },
+            )
             return
         try:
             await self._ins_trade_open(bot, s, o, float(lp))
@@ -531,9 +620,26 @@ class _Hub:
                 "exchange_ok_db_fail",
                 f"exchange accepted order but Supabase insert failed: {e}",
                 order=o,
+                diag={
+                    "exception_type": type(e).__name__,
+                    "ccxt_symbol": ccxt_sym,
+                    "ref_price": float(lp),
+                    "notional_usd": notional,
+                },
             )
             return
-        await reply(True, "filled", "order executed and OPEN trade row inserted", order=o)
+        await reply(
+            True,
+            "filled",
+            "order executed and OPEN trade row inserted",
+            order=o,
+            diag={
+                "ccxt_symbol": ccxt_sym,
+                "ref_price": float(lp),
+                "notional_usd": notional,
+                "amount": amt,
+            },
+        )
 
     async def _get_bot(self, bid: str | None) -> dict | None:
         if not bid:
@@ -573,27 +679,63 @@ class _Hub:
 
     async def _balance_check(
         self, pair: str, action: str, amount: float, last_px: float, market_type: str
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, dict[str, Any]]:
         try:
             b = await self.exchange.fetch_balance()
         except Exception as e:  # noqa: BLE001
-            return False, f"fetch_balance:{e}"
+            return False, f"fetch_balance:{e}", {"step": "fetch_balance", "pair": pair, "error": str(e)}
         if not b:
-            return True, "no_balance_obj"
+            return True, "no_balance_obj", {}
         base, quote = base_quote_for_balance(pair, market_type)
         if not base or not quote:
-            return False, f"cannot parse base/quote from pair={pair!r}"
+            return False, f"cannot parse base/quote from pair={pair!r}", {
+                "step": "parse_pair",
+                "pair": pair,
+                "market_type": market_type,
+            }
         notional = amount * last_px
         a = (action or "").upper()
         if a in ("BUY", "CLOSE_SHORT"):
             free = _ccxt_free(b, quote)
-            if free < notional * 0.999:
-                return False, f"need {quote} free {free} < {notional}"
+            mt = (market_type or "").lower()
+            # Linear/inverse: CCXT often reports free=0 while total≈equity (worker [feed] uses total).
+            if mt in ("linear", "inverse"):
+                tot = _ccxt_total(b, quote)
+                spendable = max(free, tot)
+                if spendable < notional * 0.999:
+                    return False, (
+                        f"need {quote} spendable {spendable} (free={free} total={tot}) < notional {notional}"
+                    ), {
+                        "step": "quote_margin",
+                        "quote": quote,
+                        "free": free,
+                        "total": tot,
+                        "spendable": spendable,
+                        "notional": notional,
+                        "amount": amount,
+                        "last_px": last_px,
+                        "action": a,
+                        "market_type": mt,
+                    }
+            elif free < notional * 0.999:
+                return False, f"need {quote} free {free} < {notional}", {
+                    "step": "spot_quote",
+                    "quote": quote,
+                    "free": free,
+                    "notional": notional,
+                    "action": a,
+                }
         if a in ("SELL", "CLOSE_LONG"):
             free2 = _ccxt_free(b, base)
             if free2 < amount * 0.999:
-                return False, f"need {base} free {free2} < {amount}"
-        return True, "ok"
+                return False, f"need {base} free {free2} < {amount}", {
+                    "step": "base_position",
+                    "base": base,
+                    "free": free2,
+                    "amount": amount,
+                    "action": a,
+                }
+        return True, "ok", {}
 
     async def _exec_order(self, s: dict, last_price: float, market_type: str) -> dict:
         a = (s.get("action") or "").upper()
@@ -602,13 +744,17 @@ class _Hub:
             raise ValueError(f"action {a}")
         pair_disp = normalize_trading_pair(str(s.get("pair") or ""))
         ccxt_sym = display_pair_to_ccxt_or_raise(pair_disp, market_type)
+        market = self.exchange.market(ccxt_sym)
+        params: dict = {}
+        if not market.get("spot"):
+            params["positionIdx"] = int((os.getenv("BYBIT_POSITION_IDX") or "0").strip() or "0")
         amt = float(s.get("amount", 0))
         t = s.get("type", "MARKET")
         p = s.get("price")
         if (t or "").upper() == "MARKET" or t is None:
-            return await self.exchange.create_market_order(ccxt_sym, side, amt, {})
+            return await self.exchange.create_market_order(ccxt_sym, side, amt, params)
         return await self.exchange.create_limit_order(
-            ccxt_sym, side, amt, float(p) if p else last_price, {}
+            ccxt_sym, side, amt, float(p) if p else last_price, params
         )
 
     async def _ins_trade_open(self, bot: dict, sig: dict, o: dict, last_px: float) -> None:
@@ -663,6 +809,12 @@ class _Hub:
         await asyncio.to_thread(_i)
 
     async def _mark_error(self, bot_id: str, err: str) -> None:
+        logger.error(
+            "HUB_MARK_BOT_ERROR bot_id=%s — Supabase bots.status will be set to error. detail=%s",
+            bot_id,
+            str(err)[:2000],
+        )
+
         def _m():
             self.supabase.table("bots").update(
                 {
@@ -684,7 +836,10 @@ class _Hub:
             try:
                 await self.handle_signal(raw)
             except Exception:  # noqa: BLE001
-                logger.exception("handle_signal error")
+                logger.exception(
+                    "handle_signal crashed (signal not fully processed) raw_prefix=%s",
+                    (raw if isinstance(raw, str) else str(raw))[:500],
+                )
 
     async def hub_status_loop(self) -> None:
         while True:
@@ -715,6 +870,27 @@ def _ccxt_free(bal: Any, ccy: str) -> float:
         return float(x.get("free", 0) or 0.0)
     if isinstance(x, (int, float, str)):
         return float(x)
+    return 0.0
+
+
+def _ccxt_total(bal: Any, ccy: str) -> float:
+    """Unified USDT row total (free+used) — closer to wallet equity than ``free`` alone."""
+    x = bal.get(ccy) if bal else None
+    if x is None:
+        return 0.0
+    if isinstance(x, dict):
+        t = x.get("total")
+        if t is not None:
+            try:
+                return float(t)
+            except (TypeError, ValueError):
+                pass
+        fr, us = x.get("free"), x.get("used")
+        if fr is not None and us is not None:
+            try:
+                return float(fr) + float(us)
+            except (TypeError, ValueError):
+                pass
     return 0.0
 
 
@@ -802,7 +978,8 @@ def build_exchange() -> Any:
             "apiKey": key,
             "secret": sec,
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
+            # Hub only trades linear perps; "spot" mis-routes fetch_balance / wallet vs contract margin.
+            "options": {"defaultType": "swap"},
         }
     )
     # Demo trading (paper on api-demo.*) and testnet (testnet.bybit keys) are different; CCXT rejects both.
