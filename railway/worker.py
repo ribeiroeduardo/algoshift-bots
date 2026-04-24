@@ -28,6 +28,7 @@ from railway.lib.trading_pair_ccxt import (
     trading_pair_to_ccxt,
 )
 from railway.lib.redis_client import make_redis_client
+from railway.lib.redis_topics import ORDER_OUTCOMES
 from railway.lib.strategy_loader import load_strategy_from_db
 from railway.lib.supabase_client import make_supabase_for_worker
 
@@ -88,6 +89,7 @@ class StrategyWorker:
         self.hub_status = "healthy"  # until msg
         self._q: asyncio.Queue | None = None
         self._q_status: asyncio.Queue | None = None
+        self._q_outcomes: asyncio.Queue | None = None
         self._last_strategy_error: str | None = None
         self._last_feed_log_m: float = 0.0
         self.ohlcv_timeframe = "15m"  # set in reload() from params / strategy BASE_TF / env
@@ -156,6 +158,15 @@ class StrategyWorker:
         for msg in p.listen():
             if msg and msg.get("type") == "message" and msg.get("data") and self._q:
                 loop.call_soon_threadsafe(self._q.put_nowait, msg["data"])
+
+    def _order_outcomes_thread(self, loop: asyncio.AbstractEventLoop) -> None:
+        r = make_redis_client()
+        p = r.pubsub(ignore_subscribe_messages=True)
+        p.subscribe(ORDER_OUTCOMES)
+        logger.info("subscribed %s (hub execution results)", ORDER_OUTCOMES)
+        for msg in p.listen():
+            if msg and msg.get("type") == "message" and msg.get("data") and self._q_outcomes:
+                loop.call_soon_threadsafe(self._q_outcomes.put_nowait, msg["data"])
 
     def _hub_status_thread(self, loop: asyncio.AbstractEventLoop) -> None:
         r = make_redis_client()
@@ -301,7 +312,12 @@ class StrategyWorker:
         self.redis.publish("order_signals", json.dumps(sig))
         self.last_signal_at_ms = int(sig["emitted_at_ms"])
         self.signals += 1
-        logger.info("SIGNAL %s %s", act, sig["signal_id"])
+        logger.info(
+            "SIGNAL %s %s — hub must consume order_signals; result on %s",
+            act,
+            sig["signal_id"],
+            ORDER_OUTCOMES,
+        )
 
     async def mark_error(self, err: str) -> None:
         def _m():
@@ -350,6 +366,50 @@ class StrategyWorker:
             except Exception as e:  # noqa: BLE001
                 logger.warning("heartbeat upsert: %s", e)
             await asyncio.sleep(15.0)
+
+    async def on_order_outcome(self, raw: str) -> None:
+        try:
+            d = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return
+        if str(d.get("bot_id") or "") != str(self.bot_id):
+            return
+        ok = d.get("ok")
+        stage = d.get("stage")
+        msg = d.get("message", "")
+        sig = d.get("signal_id", "")
+        logger.info(
+            "HUB_ORDER_OUTCOME ok=%s stage=%s signal_id=%s %s",
+            ok,
+            stage,
+            sig,
+            (msg or "")[:300],
+        )
+        strat = self.strategy
+        if strat is None:
+            return
+        for name in ("on_order_outcome", "on_hub_order_result"):
+            fn = getattr(strat, name, None)
+            if callable(fn):
+                try:
+                    fn(d)
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("%s failed: %s", name, e)
+                break
+
+    async def outcomes_loop(self) -> None:
+        if self._q_outcomes is None:
+            self._q_outcomes = asyncio.Queue(maxsize=500)
+        loop = asyncio.get_running_loop()
+        threading.Thread(
+            target=self._order_outcomes_thread,
+            args=(loop,),
+            daemon=True,
+            name="redis-order-outcomes",
+        ).start()
+        while True:
+            raw = await self._q_outcomes.get()
+            await self.on_order_outcome(raw)
 
     async def hub_stat_loop(self) -> None:
         if self._q_status is None:
@@ -402,7 +462,11 @@ class StrategyWorker:
             )
         pair = self.bot_row.get("trading_pair") or default_trading_pair()
         await asyncio.gather(
-            self.config_loop(), self.hb_loop(), self.hub_stat_loop(), self.market(pair)
+            self.config_loop(),
+            self.hb_loop(),
+            self.hub_stat_loop(),
+            self.outcomes_loop(),
+            self.market(pair),
         )
 
 

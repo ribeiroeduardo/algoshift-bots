@@ -28,6 +28,7 @@ from railway.lib.trading_pair_ccxt import (
     trading_pair_to_ccxt,
 )
 from railway.lib.redis_client import make_redis_client
+from railway.lib.redis_topics import ORDER_OUTCOMES
 from railway.lib.strategy_loader import load_strategy_from_db
 from railway.lib.supabase_client import make_supabase_for_worker
 
@@ -141,6 +142,7 @@ class StrategyWorker:
         self.hub_status = "healthy"
         self._q: asyncio.Queue | None = None
         self._q_status: asyncio.Queue | None = None
+        self._q_outcomes: asyncio.Queue | None = None
         self._last_strategy_error: str | None = None
         self._last_feed_log_m: float = 0.0
         self.ohlcv_timeframe = "15m"
@@ -148,8 +150,9 @@ class StrategyWorker:
         self._warned_no_bybit: bool = False
 
         # Flags de controle para threads Redis
-        self._stop_market_thread  = threading.Event()
-        self._stop_status_thread  = threading.Event()
+        self._stop_market_thread = threading.Event()
+        self._stop_status_thread = threading.Event()
+        self._stop_outcomes_thread = threading.Event()
 
     async def reload(self) -> None:
         r = (
@@ -335,7 +338,12 @@ class StrategyWorker:
         self.redis.publish("order_signals", json.dumps(sig))
         self.last_signal_at_ms = int(sig["emitted_at_ms"])
         self.signals += 1
-        logger.info("SIGNAL %s %s", act, sig["signal_id"])
+        logger.info(
+            "SIGNAL %s %s — hub order_signals; resultado em %s",
+            act,
+            sig["signal_id"],
+            ORDER_OUTCOMES,
+        )
 
     async def mark_error(self, err: str) -> None:
         def _m():
@@ -384,6 +392,46 @@ class StrategyWorker:
             except Exception as e:  # noqa: BLE001
                 logger.warning("heartbeat upsert: %s", e)
             await asyncio.sleep(15.0)
+
+    async def on_order_outcome(self, raw: str) -> None:
+        try:
+            d = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return
+        if str(d.get("bot_id") or "") != str(self.bot_id):
+            return
+        logger.info(
+            "HUB_ORDER_OUTCOME ok=%s stage=%s signal_id=%s %s",
+            d.get("ok"),
+            d.get("stage"),
+            d.get("signal_id"),
+            str(d.get("message", ""))[:300],
+        )
+        strat = self.strategy
+        if strat is None:
+            return
+        for name in ("on_order_outcome", "on_hub_order_result"):
+            fn = getattr(strat, name, None)
+            if callable(fn):
+                try:
+                    fn(d)
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("%s failed: %s", name, e)
+                break
+
+    async def outcomes_loop(self) -> None:
+        if self._q_outcomes is None:
+            self._q_outcomes = asyncio.Queue(maxsize=500)
+        loop = asyncio.get_running_loop()
+        threading.Thread(
+            target=_redis_subscribe_loop,
+            args=(ORDER_OUTCOMES, self._q_outcomes, loop, self._stop_outcomes_thread, "order-outcomes"),
+            daemon=True,
+            name="redis-order-outcomes",
+        ).start()
+        while True:
+            raw = await self._q_outcomes.get()
+            await self.on_order_outcome(raw)
 
     async def hub_stat_loop(self) -> None:
         """Consome hub:status via fila preenchida pela thread com reconexão."""
@@ -448,12 +496,14 @@ class StrategyWorker:
                 self.config_loop(),
                 self.hb_loop(),
                 self.hub_stat_loop(),
+                self.outcomes_loop(),
                 self.market(pair),
             )
         finally:
             # Sinaliza threads para parar na saída limpa
             self._stop_market_thread.set()
             self._stop_status_thread.set()
+            self._stop_outcomes_thread.set()
 
 
 def main() -> None:

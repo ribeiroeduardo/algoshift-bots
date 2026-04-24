@@ -23,6 +23,7 @@ from supabase import Client
 
 from railway.lib.bot_params import parse_bot_params
 from railway.lib.redis_client import make_redis_client
+from railway.lib.redis_topics import ORDER_OUTCOMES
 from railway.lib.supabase_client import make_supabase_for_hub
 from railway.lib.trading_pair_ccxt import (
     base_quote_for_balance,
@@ -56,7 +57,6 @@ SIGNALS_PER_MIN_WARN = 10
 POLL_INTERVAL_SEC = float((os.getenv("HUB_POLL_INTERVAL_SEC") or "0.35").strip() or "0.35")
 POLL_LOG_INTERVAL_SEC = float((os.getenv("HUB_POLL_LOG_SEC") or "1.0").strip() or "1.0")
 FETCH_TICKER_TIMEOUT_SEC = float((os.getenv("HUB_FETCH_TIMEOUT_SEC") or "25.0").strip() or "25.0")
-
 
 @dataclass
 class _Hub:
@@ -367,9 +367,53 @@ class _Hub:
             if d and self._sig_queue is not None:
                 loop.call_soon_threadsafe(self._sig_queue.put_nowait, d)
 
+    async def _publish_order_outcome(self, payload: dict) -> None:
+        payload.setdefault("published_at_ms", int(time.time() * 1000))
+        body = json.dumps(payload, default=_json_ser)
+
+        def _pub() -> None:
+            try:
+                self.redis.publish(ORDER_OUTCOMES, body)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("order_outcomes publish: %s", e)
+
+        await asyncio.to_thread(_pub)
+
     async def handle_signal(self, raw: str) -> None:
+        s: dict = {}
+        bot: dict | None = None
+
+        async def reply(ok: bool, stage: str, message: str, order: dict | None = None) -> None:
+            p: dict = {
+                "ok": ok,
+                "stage": stage,
+                "message": (message or "")[:2000],
+                "signal_id": s.get("signal_id"),
+                "bot_id": str((bot or {}).get("id") or s.get("bot_id") or ""),
+                "action": s.get("action"),
+                "pair": s.get("pair"),
+                "amount": s.get("amount"),
+            }
+            if order is not None:
+                p["exchange_order_id"] = str(order.get("id") or "")
+                av = order.get("average") or order.get("price")
+                if av is not None:
+                    try:
+                        p["average"] = float(av)
+                    except (TypeError, ValueError):
+                        p["average"] = av
+                st_o = order.get("status")
+                if st_o is not None:
+                    p["order_status"] = st_o
+                if order.get("filled") is not None:
+                    p["filled"] = order.get("filled")
+            await self._publish_order_outcome(p)
+
         try:
-            s: dict = json.loads(raw)
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                raise TypeError("signal is not an object")
+            s = parsed
         except Exception:  # noqa: BLE001
             logger.warning("dropped: bad json")
             return
@@ -379,34 +423,53 @@ class _Hub:
             return
         if not self._take_id(str(sid)):
             logger.info("duplicate signal ignored: %s", sid)
+            await reply(False, "duplicate", "hub dedupe: this signal_id was already handled")
             return
         self._bump_rate(str(s.get("bot_id", "")))
+        logger.info(
+            "order_signal bot_id=%s signal_id=%s action=%s amount=%s pair=%s",
+            s.get("bot_id"),
+            sid,
+            s.get("action"),
+            s.get("amount"),
+            s.get("pair"),
+        )
         bot = await self._get_bot(s.get("bot_id"))
         if not bot:
             logger.warning("unknown bot %s", s.get("bot_id"))
+            await reply(False, "unknown_bot", "no row in public.bots for bot_id")
             return
         st = (bot.get("status") or "").lower()
         if st != "running":
             logger.info("bot %s status=%s ignore", bot.get("id"), st)
+            await reply(
+                False,
+                "bot_not_running",
+                f"hub only executes when bot status is 'running' (got {st!r})",
+            )
             return
 
         try:
             amt = float(s["amount"])
         except (TypeError, KeyError, ValueError):
             logger.warning("bad amount")
+            await reply(False, "bad_amount", "missing or invalid amount on signal")
             return
         caps = parse_bot_params(bot.get("params"))
         mx = float(caps.get("max_order_size") or 0)
         if amt <= 0:
             logger.warning("amount <= 0")
+            await reply(False, "invalid_amount", "amount must be > 0")
             return
         if mx > 0 and amt > mx:
             logger.warning("amount %s > params.max_order_size %s", amt, mx)
             await self._mark_error(bot["id"], f"invalid amount {amt}")
+            await reply(False, "max_order_size", f"amount {amt} > params.max_order_size {mx}")
             return
         pair = normalize_trading_pair(str(s.get("pair", "") or ""))
         if not pair:
             logger.warning("dropped: empty pair")
+            await reply(False, "empty_pair", "signal.pair is empty")
             return
         mt_bot = (bot.get("market_type") or "linear").lower()
         if mt_bot not in ("spot", "linear", "inverse"):
@@ -416,11 +479,21 @@ class _Hub:
             lp = await self._refetch_ticker_price(pair, mt_bot)
         if not lp:
             logger.warning("no price for %s defer", pair)
+            await reply(
+                False,
+                "no_price",
+                f"hub has no last price for {pair!r} (stale feed or refetch failed); cannot size order",
+            )
             return
         notional = amt * float(lp)
         mnot = float(caps.get("max_notional_usd") or 0)
         if mnot and notional > mnot:
             logger.warning("notional %.2f > params.max_notional_usd %s", notional, mnot)
+            await reply(
+                False,
+                "max_notional",
+                f"notional {notional:.2f} > params.max_notional_usd {mnot}",
+            )
             return
 
         oc = await self._open_trades_count(bot["id"])
@@ -428,11 +501,17 @@ class _Hub:
         act = s.get("action", "")
         if mpos > 0 and act in ("BUY", "SELL") and oc >= mpos:
             logger.info("bot at max open positions: %d", oc)
+            await reply(
+                False,
+                "max_open_positions",
+                f"open trades={oc} >= params.max_open_positions={mpos}",
+            )
             return
 
         ok, why = await self._balance_check(pair, s.get("action", ""), amt, float(lp), mt_bot)
         if not ok:
             logger.warning("balance check fail: %s", why)
+            await reply(False, "balance_check", why)
             return
 
         try:
@@ -441,8 +520,20 @@ class _Hub:
             logger.exception("order failed: %s", e)
             await self._mark_error(bot["id"], f"exec: {e}")
             await self._ins_trade_rej(bot, s, str(e))
+            await reply(False, "exchange", str(e))
             return
-        await self._ins_trade_open(bot, s, o, float(lp))
+        try:
+            await self._ins_trade_open(bot, s, o, float(lp))
+        except Exception as e:  # noqa: BLE001
+            logger.exception("trade insert failed after fill: %s", e)
+            await reply(
+                True,
+                "exchange_ok_db_fail",
+                f"exchange accepted order but Supabase insert failed: {e}",
+                order=o,
+            )
+            return
+        await reply(True, "filled", "order executed and OPEN trade row inserted", order=o)
 
     async def _get_bot(self, bid: str | None) -> dict | None:
         if not bid:
@@ -722,6 +813,11 @@ def build_exchange() -> Any:
     if use_demo:
         ex.enable_demo_trading(True)
         logger.info("Bybit mode=demo (api-demo); unset BYBIT_USE_TESTNET")
+        logger.info(
+            "Bybit demo note: public linear prices (last/mark/index) follow the live market — "
+            "orders/balance are paper on demo, but the quote stream is not a separate synthetic tape. "
+            "For a different price feed use testnet (BYBIT_USE_TESTNET=true + testnet keys), not demo."
+        )
     elif use_testnet:
         ex.set_sandbox_mode(True)
         logger.info("Bybit mode=testnet")
