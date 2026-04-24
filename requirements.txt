@@ -1,5 +1,7 @@
 # Root: Nixpacks installs from here (package.json trumps; keep this for Python services).
 # supabase 2.3.x + loose gotrue — use pinned
+# urllib3 v2 warns (and can misbehave) on macOS LibreSSL 2.x; v1 is compatible with our deps
+urllib3>=1.26.5,<2
 supabase==2.28.3
 ccxt>=4.3.0
 python-dotenv==1.0.0

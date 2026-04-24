@@ -1,10 +1,10 @@
-"""ORB live: NY 15m bars from ticks; worker injects `account_equity` (Bybit total in quote). Paste as `bots.content`."""
+"""ORB live: NY session logic on BASE_TF; worker kline vol uses same TF (BASE_TF) unless overridden in `bots.params`. Injects `account_equity` (Bybit). Paste as `bots.content`."""
 from __future__ import annotations
 
 import logging
 import os
 import time
-from datetime import datetime, timedelta, time, timezone
+from datetime import datetime, timedelta, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
 # --- tweak below (BASE_TF must equal SIGNAL_TF for this script) ---
@@ -58,12 +58,12 @@ class Strategy:
         raise ValueError(f'unsupported tf {tf!r}')
 
     @staticmethod
-    def _parse_hm(s: str) -> time:
+    def _parse_hm(s: str) -> dtime:
         h, m = s.strip().split(':')
-        return time(int(h), int(m))
+        return dtime(int(h), int(m))
 
     @staticmethod
-    def _time_to_minutes(t: time) -> int:
+    def _time_to_minutes(t: dtime) -> int:
         return t.hour * 60 + t.minute
 
     @staticmethod

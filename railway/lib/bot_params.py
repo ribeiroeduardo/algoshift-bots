@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 
@@ -47,3 +48,21 @@ def parse_bot_params(raw: Any) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {}
+
+
+def resolve_ohlcv_timeframe(params: dict, strategy_hint: str | None) -> str:
+    """
+    Kline interval for Bybit/candle fields in market_data. Priority:
+    1) bots.params ohlcv_timeframe / ohlcv_tf / candle_timeframe / kline_timeframe
+    2) module-level hint from strategy code (e.g. BASE_TF = '1min' -> '1m')
+    3) env WORKER_OHLCV_TIMEFRAME
+    4) default 15m
+    """
+    p = params or {}
+    for key in ("ohlcv_timeframe", "ohlcv_tf", "candle_timeframe", "kline_timeframe"):
+        v = p.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    if strategy_hint and str(strategy_hint).strip():
+        return str(strategy_hint).strip()
+    return (os.getenv("WORKER_OHLCV_TIMEFRAME") or "15m").strip() or "15m"

@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
-from railway.lib.bot_params import resolve_signal_amount
+from railway.lib.bot_params import parse_bot_params, resolve_ohlcv_timeframe, resolve_signal_amount
 from railway.lib.bybit_balance import get_cached_equity_sync, has_bybit_api_credentials
 from railway.lib.bybit_ohlcv import get_candle_volume_snapshot
 from railway.lib.redis_client import make_redis_client
@@ -82,7 +82,8 @@ class StrategyWorker:
         self._q_status: asyncio.Queue | None = None
         self._last_strategy_error: str | None = None
         self._last_feed_log_m: float = 0.0
-        self.ohlcv_timeframe = (os.getenv("WORKER_OHLCV_TIMEFRAME") or "15m").strip() or "15m"
+        self.ohlcv_timeframe = "15m"  # set in reload() from params / strategy BASE_TF / env
+        self._ohlcv_hint: str | None = None
         self._warned_no_bybit: bool = False
 
     async def reload(self) -> None:
@@ -103,7 +104,8 @@ class StrategyWorker:
         content = self.bot_row.get("content") or ""
         compile_key = sha256(f"{content}\0{raw}".encode()).hexdigest()
         if compile_key != self._compile_key or self.strategy is None:
-            inst, err = load_strategy_from_db(self.supabase, self.bot_id)
+            inst, err, ohlc_hint = load_strategy_from_db(self.supabase, self.bot_id)
+            self._ohlcv_hint = ohlc_hint
             if inst is not None:
                 self.strategy = inst
                 self._compile_key = compile_key
@@ -114,6 +116,10 @@ class StrategyWorker:
                 logger.error("compile fail: %s", err)
                 self.strategy = None
                 self._compile_key = None
+        self.ohlcv_timeframe = resolve_ohlcv_timeframe(
+            parse_bot_params(self.bot_row.get("params")),
+            self._ohlcv_hint,
+        )
         st = (self.bot_row.get("status") or "").lower()
         if st == "error":
             logger.info(
