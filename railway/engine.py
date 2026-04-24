@@ -1,5 +1,5 @@
 import os
-import time
+import sys
 import logging
 import traceback
 import asyncio
@@ -8,29 +8,62 @@ from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
-# Configuração de Logs
+# Railway/Docker: no TTY → full buffering → deploy log looks empty until process dies
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+
+class _FlushStreamHandler(logging.StreamHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - [%(levelname)s] - %(message)s'
+    format="%(asctime)s - [%(levelname)s] - %(message)s",
+    handlers=[_FlushStreamHandler(sys.stderr)],
+    force=True,
 )
 logger = logging.getLogger("RailwayWorker")
 
+
+def _trace(msg: str) -> None:
+    """Always flushed; survives if logging setup fails."""
+    print(f"[engine-trace] {msg}", file=sys.stderr, flush=True)
+
+
 load_dotenv()
+_trace("module loaded, dotenv applied")
+
+
+def _require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"missing env: {name}")
+    return v
 
 class RailwayTradingEngine:
     def __init__(self):
+        _trace("RailwayTradingEngine.__init__ start")
         # Conexão Supabase
-        self.supabase: Client = create_client(
-            os.getenv("SUPABASE_URL"), 
-            os.getenv("SUPABASE_KEY")
-        )
-        
+        url = _require_env("SUPABASE_URL")
+        key = _require_env("SUPABASE_KEY")
+        _trace("creating supabase client")
+        self.supabase: Client = create_client(url, key)
+        _trace("supabase client OK")
+
         # Conexão Bybit (via CCXT)
+        _trace("creating ccxt bybit")
         self.exchange = ccxt.bybit({
-            'apiKey': os.getenv("BYBIT_API_KEY"),
-            'secret': os.getenv("BYBIT_API_SECRET"),
-            'enableRateLimit': True,
+            "apiKey": os.getenv("BYBIT_API_KEY"),
+            "secret": os.getenv("BYBIT_API_SECRET"),
+            "enableRateLimit": True,
         })
+        _trace("ccxt bybit OK")
         
         self.active_version_id = None
         self.strategy_instance = None
@@ -38,43 +71,78 @@ class RailwayTradingEngine:
         self.start_time = datetime.now()
 
     async def fetch_and_sync_strategy(self):
-        """Busca a versão ativa no Supabase e compila se houver mudança."""
+        """Load active row from public.strategy_versions (status enum: active)."""
         try:
-            # Query buscando a versão marcada como e_ativa=true
-            response = self.supabase.table("versoes") \
-                .select("id, codigo_python, parametros") \
-                .eq("e_ativa", True) \
-                .limit(1).execute()
+            # Schema: strategy_versions(id, strategy_id, version_number, content, status, ...)
+            # Optional STRATEGY_ID env scopes to one strategy; else newest active by version_number.
+            _trace("fetch_and_sync: query strategy_versions status=active")
+            q = (
+                self.supabase.table("strategy_versions")
+                .select("id, strategy_id, version_number, content, status")
+                .eq("status", "active")
+            )
+            strategy_id = os.getenv("STRATEGY_ID")
+            if strategy_id:
+                q = q.eq("strategy_id", strategy_id)
+                _trace(f"fetch_and_sync: filter strategy_id={strategy_id!r}")
+            response = q.order("version_number", desc=True).limit(1).execute()
+            n = len(response.data or [])
+            _trace(f"fetch_and_sync: rows={n} active_version_id={self.active_version_id!r}")
+            logger.info("Supabase strategy_versions query ok rows=%s", n)
 
             if response.data:
                 version = response.data[0]
-                if version['id'] != self.active_version_id:
-                    logger.info(f"🔄 Nova versão detectada (ID: {version['id']}). Atualizando lógica...")
-                    self.active_version_id = version['id']
-                    self._compile_logic(version['codigo_python'], version['parametros'])
+                if version["id"] != self.active_version_id:
+                    logger.info(
+                        "Nova versao ativa id=%s strategy_id=%s v=%s",
+                        version["id"],
+                        version["strategy_id"],
+                        version["version_number"],
+                    )
+                    self.active_version_id = version["id"]
+                    # No per-version params column in schema; strategies use empty dict unless extended.
+                    self._compile_logic(version["content"], {})
+                else:
+                    _trace("fetch_and_sync: same version id, skip compile")
             else:
-                logger.warning("⚠️ Nenhuma versão ativa encontrada no Supabase.")
+                logger.warning(
+                    "Nenhuma strategy_versions com status=active (STRATEGY_ID set? %s)",
+                    bool(strategy_id),
+                )
+                _trace(
+                    "fetch_and_sync: empty (table strategy_versions, status active; optional env STRATEGY_ID)"
+                )
         except Exception as e:
             logger.error(f"Erro ao sincronizar com Supabase: {e}")
+            _trace(f"fetch_and_sync EXC: {e!r}")
+            traceback.print_exc()
 
     def _compile_logic(self, code_str, params):
         """Injeta dinamicamente o código Python (Opção A)."""
         try:
+            code_len = len(code_str or "")
+            _trace(f"_compile_logic: code_len={code_len} params_type={type(params).__name__}")
             local_context = {}
             # Executa a string de código no contexto local
             exec(code_str, {}, local_context)
-            
-            if 'Strategy' in local_context:
+            keys = list(local_context.keys())
+            _trace(f"_compile_logic: exec done local_keys={keys[:20]}{'...' if len(keys) > 20 else ''}")
+
+            if "Strategy" in local_context:
                 # Instancia a classe passando os parâmetros do banco
-                self.strategy_instance = local_context['Strategy'](params)
+                self.strategy_instance = local_context["Strategy"](params)
                 logger.info("✅ Estratégia instanciada com sucesso.")
+                _trace("_compile_logic: Strategy() OK")
             else:
                 logger.error("❌ Classe 'Strategy' não encontrada no código injetado.")
+                _trace("_compile_logic: no Strategy class in local_context")
         except Exception as e:
             logger.error(f"Falha na compilação dinâmica: {e}")
+            _trace(f"_compile_logic EXC: {e!r}")
             traceback.print_exc()
 
     async def run_loop(self):
+        _trace("run_loop: entered")
         logger.info("🚀 Motor iniciado. Monitorando Bybit...")
         
         # Limite de 1 hora de execução (Conforme seu requisito)
@@ -133,5 +201,13 @@ class RailwayTradingEngine:
             logger.error(f"Erro ao salvar trade: {e}")
 
 if __name__ == "__main__":
-    engine = RailwayTradingEngine()
-    asyncio.run(engine.run_loop())
+    _trace("__main__: start")
+    try:
+        engine = RailwayTradingEngine()
+        _trace("__main__: engine constructed, asyncio.run")
+        asyncio.run(engine.run_loop())
+        _trace("__main__: asyncio.run finished")
+    except Exception as e:
+        _trace(f"__main__ FATAL: {e!r}")
+        traceback.print_exc()
+        raise
