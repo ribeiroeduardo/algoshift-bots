@@ -101,8 +101,10 @@ def _coerce_params(raw: Any) -> dict:
 
 def compile_code_to_instance(code: str, params: dict) -> tuple[object | None, str | None]:
     try:
+        # Single mapping: class bodies + methods must see module-level names (constants,
+        # helpers). exec(code, {}, locals) leaves globals empty so Strategy.__init__ misses BASE_TF.
         local_context: dict[str, Any] = {}
-        exec(code or "", {}, local_context)
+        exec(code or "", local_context)
         return _strategy_from_exec_locals(local_context, params)
     except Exception as e:  # noqa: BLE001
         logger.exception("exec failed: %s", e)

@@ -692,10 +692,12 @@ const StrategiesPage = () => {
           </div>
         </div>
         <p className="mb-1 text-[11px] text-[#666]">
-          Order size for signals: set JSON on row <span className="font-mono">params.signal_amount</span>{" "}
-          (or <span className="font-mono">params.amount</span>) via SQL / Table Editor. Optional hub caps:{" "}
+          Order size: worker reads <span className="font-mono">signal_amount</span> /{" "}
+          <span className="font-mono">order_size</span> / <span className="font-mono">amount</span> on the strategy
+          instance, or <span className="font-mono">get_signal_amount()</span>. Optional fallback:{" "}
+          <span className="font-mono">bots.params</span>. Hub risk caps (if used):{" "}
           <span className="font-mono">max_order_size</span>, <span className="font-mono">max_notional_usd</span>,{" "}
-          <span className="font-mono">max_open_positions</span> inside <span className="font-mono">params</span>.
+          <span className="font-mono">max_open_positions</span> in params.
         </p>
         <p className="mb-1 text-[11px] text-[#666]">
           Start/Pause/Stop on this page or <Link to="/" className="text-[#0070f3] hover:underline">Home</Link>.

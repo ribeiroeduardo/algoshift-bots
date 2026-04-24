@@ -274,8 +274,8 @@ class RailwayTradingEngine:
             code_len = len(code_str or "")
             _trace(f"_compile_logic: code_len={code_len} params_type={type(params).__name__}")
             local_context = {}
-            # Executa a string de código no contexto local
-            exec(code_str, {}, local_context)
+            # Same dict for globals+locals so class methods see module-level constants.
+            exec(code_str, local_context)
             keys = list(local_context.keys())
             _trace(f"_compile_logic: exec done local_keys={keys[:20]}{'...' if len(keys) > 20 else ''}")
 

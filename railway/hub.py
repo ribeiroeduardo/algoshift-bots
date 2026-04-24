@@ -45,6 +45,11 @@ SIG_TTL = 300.0
 MAX_SEEN = 10_000
 MAX_FAIL_BEFORE_STALE = 10
 SIGNALS_PER_MIN_WARN = 10
+# When CCXT has no watch_ticker for Bybit (e.g. demo), fall back to REST polling.
+# Default 0.35s between successful fetches (raise if Bybit rate-limits). Logs: HUB_POLL_LOG_SEC.
+POLL_INTERVAL_SEC = float((os.getenv("HUB_POLL_INTERVAL_SEC") or "0.35").strip() or "0.35")
+POLL_LOG_INTERVAL_SEC = float((os.getenv("HUB_POLL_LOG_SEC") or "1.0").strip() or "1.0")
+FETCH_TICKER_TIMEOUT_SEC = float((os.getenv("HUB_FETCH_TIMEOUT_SEC") or "25.0").strip() or "25.0")
 
 
 @dataclass
@@ -61,6 +66,7 @@ class _Hub:
     signal_bursts: dict[str, deque] = field(default_factory=dict)  # bot_id -> last emit times
     _sig_queue: asyncio.Queue | None = None
     _stale_published: bool = False
+    _poll_log_at: dict[str, float] = field(default_factory=dict)
 
     def _prune_sig_cache(self) -> None:
         now = time.time()
@@ -114,24 +120,26 @@ class _Hub:
 
         return await asyncio.to_thread(_run)
 
-    def publish_tick(self, pair: str, t: dict) -> None:
+    def publish_tick(self, pair: str, t: dict, *, source: str = "bybit_ws_v5") -> None:
         now_ms = int(time.time() * 1000)
-        last = t.get("last") or t.get("close")
-        if last is None and isinstance(t.get("info"), dict):
-            last = t["info"].get("lastPrice")
-        bid = _f(t.get("bid"))
-        ask = _f(t.get("ask"))
-        last_f: float | None
-        if last is not None:
-            last_f = float(last)
-        elif bid and ask:
-            last_f = (float(bid) + float(ask)) / 2.0
-        else:
-            last_f = None
+        last_f, bid, ask = _ticker_prices(t)
         if last_f is None:
-            logger.debug("no last/bid/ask for %s — skip pub", pair)
+            keys = list(t.keys()) if isinstance(t, dict) else []
+            logger.warning(
+                "skip publish %s: no price in ticker (keys=%s) source=%s",
+                pair,
+                keys[:25],
+                source,
+            )
             return
         self.last_prices[pair] = last_f
+        if source == "bybit_rest_poll":
+            ts = time.time()
+            prev = self._poll_log_at.get(pair, 0.0)
+            if ts - prev >= POLL_LOG_INTERVAL_SEC:
+                self._poll_log_at[pair] = ts
+                logger.info("market_data %s price=%.2f bid=%s ask=%s (rest poll)", pair, last_f, bid, ask)
+            logger.debug("market_data %s price=%.2f (rest poll)", pair, last_f)
         last_qty = t.get("baseVolume")
         if last_qty is None and isinstance(t.get("info"), dict):
             last_qty = t.get("info", {}).get("baseVol")
@@ -143,12 +151,78 @@ class _Hub:
             "last_qty": _f(last_qty) if last_qty is not None else None,
             "timestamp_ms": int(t.get("timestamp") or now_ms),
             "hub_published_at_ms": now_ms,
-            "source": "bybit_ws_v5",
+            "source": source,
         }
         self.last_tick_s[pair] = time.time()
         self._stale_published = False
         ch = f"market_data:{pair}"
         self.redis.publish(ch, json.dumps(payload, default=_json_ser))
+
+    def _watch_unsupported(self, err: BaseException) -> bool:
+        m = str(err).lower()
+        return "not supported" in m or "watchticker" in m
+
+    async def _poll_ticker(self, pair: str) -> None:
+        backoff = 1.0
+        fail_streak = 0
+        interval = max(0.15, POLL_INTERVAL_SEC)
+        timeout = max(5.0, FETCH_TICKER_TIMEOUT_SEC)
+        logger.info(
+            "poll_ticker: loop %s interval=%.1fs fetch_timeout=%.1fs",
+            pair,
+            interval,
+            timeout,
+        )
+        while pair in self.pairs_desired:
+            try:
+                t = await asyncio.wait_for(self.exchange.fetch_ticker(pair), timeout=timeout)
+                backoff = 1.0
+                fail_streak = 0
+                self.publish_tick(pair, t, source="bybit_rest_poll")
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                fail_streak += 1
+                logger.warning(
+                    "poll_ticker %s: fetch_ticker timed out after %.1fs (fail=%d) sleep %.1fs",
+                    pair,
+                    timeout,
+                    fail_streak,
+                    backoff,
+                )
+                if fail_streak >= MAX_FAIL_BEFORE_STALE and not self._stale_published:
+                    self.redis.publish(
+                        "market_data_stale",
+                        json.dumps(
+                            {
+                                "pair": pair,
+                                "reason": "poll_timeout",
+                                "published_at_ms": int(time.time() * 1000),
+                            }
+                        ),
+                    )
+                    self._stale_published = True
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+            except Exception as e:  # noqa: BLE001
+                fail_streak += 1
+                logger.warning("poll_ticker %s: %s sleep %.1fs fail=%d", pair, e, backoff, fail_streak)
+                if fail_streak >= MAX_FAIL_BEFORE_STALE and not self._stale_published:
+                    self.redis.publish(
+                        "market_data_stale",
+                        json.dumps(
+                            {
+                                "pair": pair,
+                                "reason": "reconnect",
+                                "published_at_ms": int(time.time() * 1000),
+                            }
+                        ),
+                    )
+                    self._stale_published = True
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+            else:
+                await asyncio.sleep(interval)
 
     async def watch_ticker(self, pair: str) -> None:
         backoff = 1.0
@@ -164,6 +238,15 @@ class _Hub:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
+                if self._watch_unsupported(e):
+                    logger.info(
+                        "watch_ticker not supported for %s (%s) — using REST poll every %.1fs",
+                        pair,
+                        e,
+                        max(0.15, POLL_INTERVAL_SEC),
+                    )
+                    await self._poll_ticker(pair)
+                    return
                 fail_streak += 1
                 logger.warning("watch_ticker %s: %s sleep %.1fs fail=%d", pair, e, backoff, fail_streak)
                 if fail_streak >= MAX_FAIL_BEFORE_STALE and not self._stale_published:
@@ -470,6 +553,36 @@ def _f(x) -> float | None:
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+def _ticker_prices(t: dict) -> tuple[float | None, float | None, float | None]:
+    """CCXT unified ticker + Bybit `info` fallbacks → (last, bid, ask)."""
+    if not isinstance(t, dict):
+        return None, None, None
+    info = t.get("info") if isinstance(t.get("info"), dict) else {}
+    last = t.get("last") or t.get("close")
+    if last is None and info:
+        last = (
+            info.get("lastPrice")
+            or info.get("last")
+            or info.get("indexPrice")
+            or info.get("markPrice")
+        )
+    bid = _f(t.get("bid"))
+    ask = _f(t.get("ask"))
+    if bid is None and info:
+        bid = _f(info.get("bid1Price") or info.get("bidPrice") or info.get("b"))
+    if ask is None and info:
+        ask = _f(info.get("ask1Price") or info.get("askPrice") or info.get("a"))
+    last_f: float | None = None
+    if last is not None:
+        try:
+            last_f = float(last)
+        except (TypeError, ValueError):
+            last_f = None
+    if last_f is None and bid is not None and ask is not None:
+        last_f = (bid + ask) / 2.0
+    return last_f, bid, ask
 
 
 def _json_ser(x):

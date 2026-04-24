@@ -186,9 +186,10 @@ Expect: `tick#...`; every 5th tick a BUY; Terminal A shows `SIGNAL: {...}` JSON.
    - `REDIS_URL` (same Redis as Hub)
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY` (no service key on workers)
+   - Optional: `BYBIT_API_KEY` / `BYBIT_API_SECRET` (+ `BYBIT_USE_DEMO` or `BYBIT_USE_TESTNET` like Hub) so the worker can inject **live quote balance** into `market_data.account_equity` for sizing
    - Optional: `STRATEGY_CLASS_NAME` if the code uses a nonstandard class name
 
-2. **DB:** that bot: `status = 'running'`, non-empty `content` (python), and `params` JSON with `signal_amount` (or `amount`) &gt; 0 so the worker publishes a non-zero size; optional hub caps in same JSON: `max_order_size`, `max_notional_usd`, `max_open_positions`.
+2. **DB:** that bot: `status = 'running'`, non-empty `content` (python) defining `Strategy` + `on_tick` (or `def on_tick`). Signal size comes from the strategy (`signal_amount` / `order_size` / `amount` / `size` attribute or `get_signal_amount()`), with optional fallback in `params`. Optional hub caps in `params`: `max_order_size`, `max_notional_usd`, `max_open_positions`.
 
 3. **Run Worker:**
 

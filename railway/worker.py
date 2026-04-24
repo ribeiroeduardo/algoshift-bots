@@ -1,6 +1,7 @@
 """
 Strategy worker: BOT_ID + Redis market_data + on_tick -> order_signals.
-No exchange keys. Run: python -m railway.worker
+Optional BYBIT_API_KEY / BYBIT_API_SECRET (+ demo/testnet flags) for account balance → sizing.
+Run: python -m railway.worker
 """
 from __future__ import annotations
 
@@ -17,7 +18,8 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
-from railway.lib.bot_params import parse_bot_params
+from railway.lib.bot_params import resolve_signal_amount
+from railway.lib.bybit_balance import get_cached_equity_sync
 from railway.lib.redis_client import make_redis_client
 from railway.lib.strategy_loader import load_strategy_from_db
 from railway.lib.supabase_client import make_supabase_for_worker
@@ -66,6 +68,7 @@ class StrategyWorker:
         self.hub_status = "healthy"  # until msg
         self._q: asyncio.Queue | None = None
         self._q_status: asyncio.Queue | None = None
+        self._last_strategy_error: str | None = None
 
     async def reload(self) -> None:
         r = (
@@ -89,8 +92,10 @@ class StrategyWorker:
             if inst is not None:
                 self.strategy = inst
                 self._compile_key = compile_key
+                self._last_strategy_error = None
                 logger.info("strategy load bot=%s", self.bot_id)
             else:
+                self._last_strategy_error = err
                 logger.error("compile fail: %s", err)
                 self.strategy = None
                 self._compile_key = None
@@ -147,29 +152,60 @@ class StrategyWorker:
             return
         self.ticks += 1
         self.last_tick_at_ms = int(time.time() * 1000)
+        pair = (self.bot_row or {}).get("trading_pair", "BTC/USDT")
+        parts = str(pair).upper().split("/")
+        quote = parts[-1] if len(parts) >= 2 else "USDT"
+        try:
+            account_equity = await asyncio.to_thread(get_cached_equity_sync, quote)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("account_equity: %s", e)
+            account_equity = None
         md = {
             "price": t.get("price"),
             "bid": t.get("bid"),
             "ask": t.get("ask"),
             "timestamp": t.get("timestamp_ms") or t.get("timestamp") or 0,
+            "last_qty": t.get("last_qty"),
+            "account_equity": account_equity,
         }
         if md["price"] is None:
             return
         try:
-            sig = self.strategy.on_tick(md)
+            raw_sig = self.strategy.on_tick(md)
         except Exception as e:  # noqa: BLE001
             logger.exception("on_tick: %s", e)
             await self.mark_error(str(e))
             os._exit(1)
+        sig = raw_sig
+        amt_override: float | None = None
+        if isinstance(raw_sig, dict):
+            sig = raw_sig.get("action") or raw_sig.get("signal")
+            a = raw_sig.get("amount")
+            if a is not None:
+                try:
+                    amt_override = float(a)
+                except (TypeError, ValueError):
+                    amt_override = None
+        elif isinstance(raw_sig, (tuple, list)) and len(raw_sig) >= 2:
+            sig = raw_sig[0]
+            try:
+                amt_override = float(raw_sig[1])
+            except (TypeError, ValueError, IndexError):
+                amt_override = None
         if sig in ("BUY", "SELL", "CLOSE_LONG", "CLOSE_SHORT"):
-            await self.emit(sig, t)
+            await self.emit(sig, t, amount_override=amt_override)
 
-    async def emit(self, act: str, t: dict) -> None:
+    async def emit(self, act: str, t: dict, amount_override: float | None = None) -> None:
         b = self.bot_row or {}
-        p = parse_bot_params(b.get("params"))
-        amt = float(p.get("signal_amount") or p.get("amount") or 0.0)
+        if amount_override is not None and amount_override > 0:
+            amt = float(amount_override)
+        else:
+            amt = resolve_signal_amount(self.strategy, b.get("params"))
         if amt <= 0:
-            logger.warning("params.signal_amount (or amount) missing or 0; skip signal")
+            logger.warning(
+                "signal size missing or 0: set on strategy (signal_amount / order_size / "
+                "amount / size or get_signal_amount()) or in bots.params; skip signal"
+            )
             return
         sig = {
             "signal_id": str(uuid.uuid4()),
@@ -269,11 +305,12 @@ class StrategyWorker:
         if not self.bot_row:
             raise RuntimeError("no bot")
         if self.strategy is None:
-            inst, err = load_strategy_from_db(self.supabase, self.bot_id)
-            if inst:
-                self.strategy = inst
-            else:
-                raise RuntimeError(f"no strategy: {err}")
+            msg = self._last_strategy_error or "unknown compile error"
+            logger.error(
+                "no runnable strategy (%s). Fix bots.content (class Strategy + on_tick, "
+                "or def on_tick). Retrying compile every ~5s via config_loop.",
+                msg,
+            )
         pair = self.bot_row.get("trading_pair", "BTC/USDT")
         await asyncio.gather(
             self.config_loop(), self.hb_loop(), self.hub_stat_loop(), self.market(pair)
