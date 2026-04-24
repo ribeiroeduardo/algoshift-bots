@@ -1,5 +1,6 @@
 import os
 import sys
+import inspect
 import logging
 import traceback
 import asyncio
@@ -76,6 +77,97 @@ def _optional_env(label: str, *keys: str) -> str | None:
             return v.strip()
     _trace(f"{label}: none set (tried {', '.join(keys)})")
     return None
+
+
+class _OnTickFnAdapter:
+    """Wraps a module-level ``def on_tick(market_data):`` for the runner."""
+
+    __slots__ = ("_fn",)
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    def on_tick(self, market_data):
+        return self._fn(market_data)
+
+
+def _strategy_from_exec_locals(local_context: dict, params: dict) -> tuple[object | None, str | None]:
+    """
+    Build an object with .on_tick(market_data).
+    Accepts: class Strategy, any user class with on_tick, def on_tick, or instance in strategy/bot/runner.
+    """
+    explicit = os.getenv("STRATEGY_CLASS_NAME", "").strip()
+    if explicit and explicit in local_context:
+        obj = local_context[explicit]
+        if isinstance(obj, type) and callable(getattr(obj, "on_tick", None)):
+            _trace(f"_compile_logic: STRATEGY_CLASS_NAME={explicit!r}")
+            return obj(params), None
+        if not isinstance(obj, type) and callable(getattr(obj, "on_tick", None)):
+            _trace(f"_compile_logic: STRATEGY_CLASS_NAME={explicit!r} (instance)")
+            return obj, None
+
+    for key in ("strategy", "bot", "runner"):
+        obj = local_context.get(key)
+        if obj is None or isinstance(obj, type):
+            continue
+        if callable(getattr(obj, "on_tick", None)):
+            _trace(f"_compile_logic: using ready-made instance local[{key!r}]")
+            return obj, None
+
+    St = local_context.get("Strategy")
+    if isinstance(St, type) and callable(getattr(St, "on_tick", None)):
+        return St(params), None
+
+    fn = local_context.get("on_tick")
+    if fn is not None and callable(fn) and not isinstance(fn, type):
+        if inspect.isroutine(fn) or inspect.isfunction(fn):
+            _trace("_compile_logic: using top-level on_tick function (wrapped)")
+            return _OnTickFnAdapter(fn), None
+
+    bad_mod = (
+        "matplotlib",
+        "numpy",
+        "pandas",
+        "PIL",
+        "sklearn",
+        "scipy",
+        "typing",
+        "collections.",
+        "ccxt",
+        "supabase",
+    )
+    candidates: list[tuple[str, type]] = []
+    for name, obj in local_context.items():
+        if name.startswith("_"):
+            continue
+        if not isinstance(obj, type):
+            continue
+        if not callable(getattr(obj, "on_tick", None)):
+            continue
+        mod = getattr(obj, "__module__", "") or ""
+        if any(mod.startswith(p) for p in bad_mod):
+            continue
+        candidates.append((name, obj))
+
+    if len(candidates) == 1:
+        name, cls = candidates[0]
+        _trace(f"_compile_logic: single candidate class {name!r} (optional: rename to Strategy)")
+        return cls(params), None
+
+    for name, cls in candidates:
+        if name.lower() == "strategy":
+            _trace(f"_compile_logic: using class {name!r}")
+            return cls(params), None
+
+    if len(candidates) > 1:
+        names = [n for n, _ in candidates]
+        return None, f"multiple on_tick classes {names}; set STRATEGY_CLASS_NAME or define class Strategy"
+
+    type_names = sorted(k for k, v in local_context.items() if isinstance(v, type))[:40]
+    return None, (
+        "need class Strategy with on_tick(self, market_data), or one user class with on_tick, "
+        f"or def on_tick(market_data). types_in_locals={type_names}"
+    )
 
 
 class RailwayTradingEngine:
@@ -166,7 +258,7 @@ class RailwayTradingEngine:
             traceback.print_exc()
 
     def _compile_logic(self, code_str, params) -> bool:
-        """Run injected code; return True if Strategy is ready."""
+        """Run injected code; return True if a runnable .on_tick exists."""
         try:
             code_len = len(code_str or "")
             _trace(f"_compile_logic: code_len={code_len} params_type={type(params).__name__}")
@@ -176,14 +268,14 @@ class RailwayTradingEngine:
             keys = list(local_context.keys())
             _trace(f"_compile_logic: exec done local_keys={keys[:20]}{'...' if len(keys) > 20 else ''}")
 
-            if "Strategy" in local_context:
-                # Instancia a classe passando os parâmetros do banco
-                self.strategy_instance = local_context["Strategy"](params)
-                logger.info("✅ Estratégia instanciada com sucesso.")
-                _trace("_compile_logic: Strategy() OK")
+            inst, err = _strategy_from_exec_locals(local_context, params)
+            if inst is not None:
+                self.strategy_instance = inst
+                logger.info("✅ Estratégia pronta (instância com on_tick).")
+                _trace("_compile_logic: instance OK")
                 return True
-            logger.error("❌ Classe 'Strategy' não encontrada no código injetado.")
-            _trace("_compile_logic: no Strategy class in local_context")
+            logger.error("❌ %s", err or "no strategy entry")
+            _trace(f"_compile_logic: {err or 'no strategy entry'}")
             return False
         except Exception as e:
             logger.error(f"Falha na compilação dinâmica: {e}")
