@@ -46,12 +46,39 @@ def _require_env(name: str) -> str:
         raise RuntimeError(f"missing env: {name}")
     return v
 
+
+def _resolve_env(label: str, *keys: str) -> str:
+    for k in keys:
+        v = os.getenv(k)
+        if v and str(v).strip():
+            _trace(f"{label}: using env key {k}")
+            return v.strip()
+    raise RuntimeError(
+        f"missing {label}: set one of {', '.join(keys)} on Railway (Variables tab)"
+    )
+
+
+def _supabase_url() -> str:
+    return _resolve_env("Supabase URL", "SUPABASE_URL", "VITE_SUPABASE_URL")
+
+
+def _supabase_key() -> str:
+    return _resolve_env(
+        "Supabase key",
+        "SUPABASE_KEY",
+        "SUPABASE_ANON_KEY",
+        "VITE_SUPABASE_ANON_KEY",
+        "SUPABASE_SERVICE_ROLE_KEY",
+        "VITE_SUPABASE_SERVICE_ROLE_KEY",
+    )
+
+
 class RailwayTradingEngine:
     def __init__(self):
         _trace("RailwayTradingEngine.__init__ start")
-        # Conexão Supabase
-        url = _require_env("SUPABASE_URL")
-        key = _require_env("SUPABASE_KEY")
+        # Conexão Supabase (Railway: no .env file — use Variables; VITE_* matches frontend .env names)
+        url = _supabase_url()
+        key = _supabase_key()
         _trace("creating supabase client")
         self.supabase: Client = create_client(url, key)
         _trace("supabase client OK")
