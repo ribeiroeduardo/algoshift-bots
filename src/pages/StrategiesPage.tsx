@@ -19,7 +19,9 @@ type StrategyWithBots = {
 
 const emptyBots: BotRow[] = [];
 
-const PAIR_RE = /^[A-Z0-9]+\/[A-Z0-9]+$/;
+/** Bybit-style (BTCUSDT, BTCUSDT.P) or legacy CCXT BASE/QUOTE */
+const TRADING_PAIR_RE =
+  /^[A-Z0-9]{5,}$|^[A-Z0-9]{3,}\.P$|^[A-Z0-9]+\/[A-Z0-9]+(:[A-Z0-9]+)?$/;
 
 const runtimeLabel: Record<BotStatus, string> = {
   stopped: "Stopped",
@@ -121,7 +123,7 @@ const StrategiesPage = () => {
   const [bForm, setBForm] = useState({
     name: "",
     versionNumber: 1,
-    tradingPair: "BTC/USDT",
+    tradingPair: "BTCUSDT.P",
   });
 
   const refetch = useCallback(async () => {
@@ -180,7 +182,7 @@ const StrategiesPage = () => {
       setBForm({
         name: "",
         versionNumber: botDrawer.nextVersion,
-        tradingPair: "BTC/USDT",
+        tradingPair: "BTCUSDT.P",
       });
     } else {
       const b = botDrawer.bot;
@@ -272,13 +274,14 @@ const StrategiesPage = () => {
     const s = getSupabaseClient()!;
     const code = botCodeRef.current?.value ?? "";
     const pair = normalizePair(bForm.tradingPair);
-    if (!PAIR_RE.test(pair)) {
-      const msg = "Trading pair must look like BTC/USDT (uppercase letters and digits).";
+    if (!TRADING_PAIR_RE.test(pair)) {
+      const msg =
+        "Ticker must be Bybit-style: BTCUSDT or BTCUSDT.P (or legacy BASE/QUOTE). Uppercase letters/digits.";
       setLoadError(msg);
       setBotSaveError(msg);
       console.warn(
         "[algoshift Strategies/bot save] validation:pair",
-        { pair, pattern: "BTC/USDT" },
+        { pair, pattern: "BTCUSDT / BTCUSDT.P" },
       );
       return;
     }
@@ -311,11 +314,13 @@ const StrategiesPage = () => {
     let saveOk = false;
     try {
       if (botDrawer.mode === "create") {
+        const insertMarket = pair.endsWith(".P") ? { market_type: "linear" as const } : {};
         const { data, error } = await s
           .from("bots")
           .insert({
             strategy_id: botDrawer.strategyId,
             status: "stopped",
+            ...insertMarket,
             ...payload,
           })
           .select("id");
@@ -761,10 +766,16 @@ const StrategiesPage = () => {
               className="w-full rounded-md border-0 bg-[#111] px-3 py-2 font-mono text-[13px] text-[#ededed] ring-1 ring-inset ring-white/[0.1] focus:outline-none focus:ring-2 focus:ring-[hsl(212,100%,48%)]"
               value={bForm.tradingPair}
               onChange={(e) => setBForm((f) => ({ ...f, tradingPair: e.target.value }))}
-              placeholder="BTC/USDT"
+              placeholder="BTCUSDT.P"
             />
           </div>
         </div>
+        <p className="mb-3 text-[11px] text-[#666]">
+          Same string Hub publishes on <span className="font-mono">market_data:…</span> (must match worker
+          subscription). <span className="font-mono">.P</span> = linear perp; plain{" "}
+          <span className="font-mono">BTCUSDT</span> uses bot <span className="font-mono">market_type</span> in DB
+          (spot vs linear). Set <span className="font-mono">market_type</span> in Supabase if needed.
+        </p>
         <p className="mb-1 text-[11px] text-[#666]">
           Order size: worker reads <span className="font-mono">signal_amount</span> /{" "}
           <span className="font-mono">order_size</span> / <span className="font-mono">amount</span> on the strategy

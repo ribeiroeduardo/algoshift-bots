@@ -24,6 +24,11 @@ from supabase import Client
 from railway.lib.bot_params import parse_bot_params
 from railway.lib.redis_client import make_redis_client
 from railway.lib.supabase_client import make_supabase_for_hub
+from railway.lib.trading_pair_ccxt import (
+    base_quote_for_balance,
+    normalize_trading_pair,
+    trading_pair_to_ccxt,
+)
 
 load_dotenv()
 
@@ -58,6 +63,7 @@ class _Hub:
     supabase: Client
     exchange: Any
     pairs_desired: set[str] = field(default_factory=set)
+    pair_market: dict[str, str] = field(default_factory=dict)
     watch_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     last_tick_s: dict[str, float] = field(default_factory=dict)
     last_prices: dict[str, float] = field(default_factory=dict)
@@ -113,10 +119,35 @@ class _Hub:
                 return f"stale_ws:{p}"
         return "ws_ok"
 
-    async def refresh_pairs(self) -> set[str]:
-        def _run():
-            r = self.supabase.table("bots").select("trading_pair").eq("status", "running").execute()
-            return {row["trading_pair"] for row in (r.data or [])}
+    async def refresh_pairs(self) -> dict[str, str]:
+        """display_ticker -> market_type (first running bot wins on conflict)."""
+
+        def _run() -> dict[str, str]:
+            r = (
+                self.supabase.table("bots")
+                .select("trading_pair", "market_type")
+                .eq("status", "running")
+                .execute()
+            )
+            out: dict[str, str] = {}
+            for row in r.data or []:
+                p = normalize_trading_pair(str(row.get("trading_pair") or ""))
+                if not p:
+                    continue
+                mt = (row.get("market_type") or "linear").lower()
+                if mt not in ("spot", "linear", "inverse"):
+                    mt = "linear"
+                if p not in out:
+                    out[p] = mt
+                elif out[p] != mt:
+                    logger.warning(
+                        "running bots disagree market_type for %s (%s vs %s); keeping %s",
+                        p,
+                        out[p],
+                        mt,
+                        out[p],
+                    )
+            return out
 
         return await asyncio.to_thread(_run)
 
@@ -184,8 +215,14 @@ class _Hub:
             timeout,
         )
         while pair in self.pairs_desired:
+            mt = self.pair_market.get(pair, "linear")
+            ccxt_sym = trading_pair_to_ccxt(pair, mt)
+            if not ccxt_sym:
+                logger.error("poll_ticker: no CCXT symbol for %s market_type=%s", pair, mt)
+                await asyncio.sleep(5.0)
+                continue
             try:
-                t = await asyncio.wait_for(self.exchange.fetch_ticker(pair), timeout=timeout)
+                t = await asyncio.wait_for(self.exchange.fetch_ticker(ccxt_sym), timeout=timeout)
                 backoff = 1.0
                 fail_streak = 0
                 self.publish_tick(pair, t, source="bybit_rest_poll")
@@ -241,7 +278,13 @@ class _Hub:
             if pair not in self.pairs_desired:
                 return
             try:
-                t = await self.exchange.watch_ticker(pair)
+                mt = self.pair_market.get(pair, "linear")
+                ccxt_sym = trading_pair_to_ccxt(pair, mt)
+                if not ccxt_sym:
+                    logger.error("watch_ticker: no CCXT symbol for %s market_type=%s", pair, mt)
+                    await asyncio.sleep(5.0)
+                    continue
+                t = await self.exchange.watch_ticker(ccxt_sym)
                 backoff = 1.0
                 fail_streak = 0
                 self.publish_tick(pair, t)
@@ -278,8 +321,9 @@ class _Hub:
         while True:
             try:
                 d = await self.refresh_pairs()
-                self.pairs_desired = d
-                for p in d:
+                self.pairs_desired = set(d.keys())
+                self.pair_market = d
+                for p in self.pairs_desired:
                     if p not in self.watch_tasks:
                         self.watch_tasks[p] = asyncio.create_task(self.watch_ticker(p), name=f"watch_{p}")
                         logger.info("started watcher %s", p)
@@ -343,10 +387,16 @@ class _Hub:
             logger.warning("amount %s > params.max_order_size %s", amt, mx)
             await self._mark_error(bot["id"], f"invalid amount {amt}")
             return
-        pair = s.get("pair", "")
+        pair = normalize_trading_pair(str(s.get("pair", "") or ""))
+        if not pair:
+            logger.warning("dropped: empty pair")
+            return
+        mt_bot = (bot.get("market_type") or "linear").lower()
+        if mt_bot not in ("spot", "linear", "inverse"):
+            mt_bot = "linear"
         lp = self.last_prices.get(pair)
         if not lp or lp <= 0:
-            lp = await self._refetch_ticker_price(pair)
+            lp = await self._refetch_ticker_price(pair, mt_bot)
         if not lp:
             logger.warning("no price for %s defer", pair)
             return
@@ -363,13 +413,13 @@ class _Hub:
             logger.info("bot at max open positions: %d", oc)
             return
 
-        ok, why = await self._balance_check(pair, s.get("action", ""), amt, float(lp))
+        ok, why = await self._balance_check(pair, s.get("action", ""), amt, float(lp), mt_bot)
         if not ok:
             logger.warning("balance check fail: %s", why)
             return
 
         try:
-            o = await self._exec_order(s, float(lp))
+            o = await self._exec_order(s, float(lp), mt_bot)
         except Exception as e:  # noqa: BLE001
             logger.exception("order failed: %s", e)
             await self._mark_error(bot["id"], f"exec: {e}")
@@ -401,9 +451,12 @@ class _Hub:
 
         return await asyncio.to_thread(_c)
 
-    async def _refetch_ticker_price(self, pair: str) -> float | None:
+    async def _refetch_ticker_price(self, pair: str, market_type: str) -> float | None:
         try:
-            t = await self.exchange.fetch_ticker(pair)
+            ccxt_sym = trading_pair_to_ccxt(pair, market_type)
+            if not ccxt_sym:
+                return None
+            t = await self.exchange.fetch_ticker(ccxt_sym)
             last = t.get("last")
             if last is not None:
                 self.last_prices[pair] = float(last)
@@ -413,7 +466,7 @@ class _Hub:
         return None
 
     async def _balance_check(
-        self, pair: str, action: str, amount: float, last_px: float
+        self, pair: str, action: str, amount: float, last_px: float, market_type: str
     ) -> tuple[bool, str]:
         try:
             b = await self.exchange.fetch_balance()
@@ -421,7 +474,9 @@ class _Hub:
             return False, f"fetch_balance:{e}"
         if not b:
             return True, "no_balance_obj"
-        base, quote = pair.split("/") if "/" in pair else ("", "")
+        base, quote = base_quote_for_balance(pair, market_type)
+        if not base or not quote:
+            return False, f"cannot parse base/quote from pair={pair!r}"
         notional = amount * last_px
         a = (action or "").upper()
         if a in ("BUY", "CLOSE_SHORT"):
@@ -434,19 +489,22 @@ class _Hub:
                 return False, f"need {base} free {free2} < {amount}"
         return True, "ok"
 
-    async def _exec_order(self, s: dict, last_price: float) -> dict:
+    async def _exec_order(self, s: dict, last_price: float, market_type: str) -> dict:
         a = (s.get("action") or "").upper()
         side = {"BUY": "buy", "SELL": "sell", "CLOSE_LONG": "sell", "CLOSE_SHORT": "buy"}.get(a)
         if not side:
             raise ValueError(f"action {a}")
-        pair = s.get("pair")
+        pair_disp = normalize_trading_pair(str(s.get("pair") or ""))
+        ccxt_sym = trading_pair_to_ccxt(pair_disp, market_type)
+        if not ccxt_sym:
+            raise ValueError(f"no CCXT symbol for pair={pair_disp!r} market_type={market_type!r}")
         amt = float(s.get("amount", 0))
         t = s.get("type", "MARKET")
         p = s.get("price")
         if (t or "").upper() == "MARKET" or t is None:
-            return await self.exchange.create_market_order(pair, side, amt, {})
+            return await self.exchange.create_market_order(ccxt_sym, side, amt, {})
         return await self.exchange.create_limit_order(
-            pair, side, amt, float(p) if p else last_price, {}
+            ccxt_sym, side, amt, float(p) if p else last_price, {}
         )
 
     async def _ins_trade_open(self, bot: dict, sig: dict, o: dict, last_px: float) -> None:

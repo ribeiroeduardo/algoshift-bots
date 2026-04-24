@@ -21,6 +21,12 @@ from dotenv import load_dotenv
 from railway.lib.bot_params import parse_bot_params, resolve_ohlcv_timeframe, resolve_signal_amount
 from railway.lib.bybit_balance import get_cached_equity_sync, has_bybit_api_credentials
 from railway.lib.bybit_ohlcv import get_candle_volume_snapshot
+from railway.lib.trading_pair_ccxt import (
+    base_quote_for_balance,
+    base_symbol_for_logs,
+    default_trading_pair,
+    trading_pair_to_ccxt,
+)
 from railway.lib.redis_client import make_redis_client
 from railway.lib.strategy_loader import load_strategy_from_db
 from railway.lib.supabase_client import make_supabase_for_worker
@@ -149,7 +155,7 @@ class StrategyWorker:
         r = (
             self.supabase.table("bots")
             .select(
-                "id, name, strategy_id, trading_pair, status, "
+                "id, name, strategy_id, trading_pair, market_type, status, "
                 "params, last_error, content, version_number"
             )
             .eq("id", self.bot_id)
@@ -218,18 +224,29 @@ class StrategyWorker:
             return
         self.ticks += 1
         self.last_tick_at_ms = int(time.time() * 1000)
-        pair = (self.bot_row or {}).get("trading_pair", "BTC/USDT")
-        parts = str(pair).upper().split("/")
-        quote = parts[-1] if len(parts) >= 2 else "USDT"
+        pair = (self.bot_row or {}).get("trading_pair") or default_trading_pair()
+        pair = str(pair).strip().upper()
+        mt = ((self.bot_row or {}).get("market_type") or "linear").lower()
+        if mt not in ("spot", "linear", "inverse"):
+            mt = "linear"
+        _base, quote = base_quote_for_balance(pair, mt)
+        if not quote:
+            quote = "USDT"
         try:
             account_equity = await asyncio.to_thread(get_cached_equity_sync, quote)
         except Exception as e:  # noqa: BLE001
             logger.debug("account_equity: %s", e)
             account_equity = None
 
+        ccxt_pair = trading_pair_to_ccxt(pair, mt)
         try:
-            ohlc = await asyncio.to_thread(
-                get_candle_volume_snapshot, pair, self.ohlcv_timeframe
+            ohlc = (
+                await asyncio.to_thread(get_candle_volume_snapshot, ccxt_pair, self.ohlcv_timeframe)
+                if ccxt_pair
+                else {
+                    "candle_ohlcv_timeframe": self.ohlcv_timeframe,
+                    "candle_ohlcv_error": f"no CCXT symbol for trading_pair={pair!r} market_type={mt!r}",
+                }
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("ohlcv snapshot: %s", e)
@@ -261,7 +278,7 @@ class StrategyWorker:
             cbd  = ohlc.get("candle_base_volume_delta")
             ma10 = ohlc.get("candle_closed_vol_ma_10")
             t_open = ohlc.get("candle_open_time_ms")
-            base_sym = (pair or "BTC/USDT").split("/")[0]
+            base_sym = base_symbol_for_logs(pair or default_trading_pair())
             err = ohlc.get("candle_ohlcv_error")
             if err and self.ticks < 3:
                 logger.warning("[ohlcv] %s", err)
@@ -317,7 +334,7 @@ class StrategyWorker:
             "version_id": self.bot_id,
             "action": act,
             "type": "MARKET",
-            "pair": b.get("trading_pair", "BTC/USDT"),
+            "pair": b.get("trading_pair") or default_trading_pair(),
             "amount": amt,
             "reason": "strategy_on_tick",
             "emitted_at_ms": int(time.time() * 1000),
@@ -432,7 +449,7 @@ class StrategyWorker:
             logger.error(
                 "no runnable strategy (%s). Fix bots.content. Retrying via config_loop.", msg
             )
-        pair = self.bot_row.get("trading_pair", "BTC/USDT")
+        pair = self.bot_row.get("trading_pair") or default_trading_pair()
         try:
             await asyncio.gather(
                 self.config_loop(),

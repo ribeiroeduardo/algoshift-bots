@@ -14,14 +14,14 @@ SIGNAL_TF = '1min'
 RISK_PER_TRADE_PCT = 1.0
 MAX_LEVERAGE = 1.0
 
-START_RANGE   = '15:05'
+START_RANGE   = '15:47'
 RANGE_MINUTES = 5
 END_OF_DAY    = '23:59'
 TRADE_DAYS    = 'WEEKDAYS'
 
 RISK_REWARD       = 3.0
 STOP_TYPE         = 'OPPOSITE'
-ENTRY_BUFFER_PCT  = 0.02
+ENTRY_BUFFER_PCT  = 0.0
 
 ENTRY_TYPE         = 'TOUCHING'
 ENTRY_PRICE_TYPE   = 'PREV_CANDLE'
@@ -53,15 +53,12 @@ ORB_LOG_SEC = float((os.environ.get("ORB_LOG_SEC") or "30.0").strip() or "30.0")
 # ─────────────────────────────────────────────────────────────────
 
 def _p(v) -> str:
-    """Formata preço."""
     return "—" if v is None else f"{float(v):,.2f}"
 
 def _q(v) -> str:
-    """Formata quantidade."""
     return "—" if v is None else f"{float(v):.6f}"
 
 def _vol(v) -> str:
-    """Formata volume."""
     return "—" if v is None else f"{float(v):.4f}"
 
 
@@ -160,14 +157,14 @@ class Strategy:
         self._status_last_m: float = 0.0
 
         # Flags de log de transição (disparam apenas uma vez por evento)
-        self._logged_pre_range    = False   # "aguardando janela de range"
-        self._logged_range_start  = False   # "iniciando mapeamento"
-        self._logged_range_end    = False   # "range mapeado"
-        self._logged_day_invalid  = False   # "dia inválido"
-        self._logged_exec_open    = False   # "janela exec aberta"
-        self._logged_signal       = False   # "sinal detectado"
-        self._logged_order        = False   # "ordem enviada"
-        self._logged_be           = False   # "break-even ativado"
+        self._logged_pre_range    = False
+        self._logged_range_start  = False
+        self._logged_range_end    = False
+        self._logged_day_invalid  = False
+        self._logged_exec_open    = False
+        self._logged_signal       = False
+        self._logged_order        = False
+        self._logged_be           = False
 
         self._log_startup(range_end_str)
 
@@ -192,7 +189,7 @@ class Strategy:
         L.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     # ──────────────────────────────────────────────────────────────
-    # Heartbeat periódico (throttled — não confundir com transições)
+    # Heartbeat periódico (throttled)
     # ──────────────────────────────────────────────────────────────
 
     def _heartbeat(self, now_ny: datetime, px: float) -> None:
@@ -204,17 +201,17 @@ class Strategy:
         cur_m = self._time_to_minutes(now_ny.time())
 
         if not self._weekday_ok(now_ny.date()):
-            self._log.info("[heartbeat] %s  px=%s  dia=%s → não opera (%s)", now_ny.strftime("%H:%M NY"), _p(px), now_ny.strftime("%A"), TRADE_DAYS)
+            self._log.info("[heartbeat] %s  px=%s  dia=%s → não opera (%s)",
+                           now_ny.strftime("%H:%M NY"), _p(px), now_ny.strftime("%A"), TRADE_DAYS)
             return
 
         if cur_m < self._sr_m:
-            mins_left = self._sr_m - cur_m
             self._log.info("[heartbeat] %s  px=%s  → aguardando janela de range (%s, em %d min)",
-                           now_ny.strftime("%H:%M NY"), _p(px), START_RANGE, mins_left)
+                           now_ny.strftime("%H:%M NY"), _p(px), START_RANGE, self._sr_m - cur_m)
             return
 
         if self._sr_m <= cur_m < self._er_m:
-            r_sz = (_p(self._r_high - self._r_low) if self._r_high and self._r_low else "—")
+            r_sz = _p(self._r_high - self._r_low) if self._r_high and self._r_low else "—"
             self._log.info("[heartbeat] %s  px=%s  → MAPEANDO RANGE  high=%s  low=%s  tamanho=%s",
                            now_ny.strftime("%H:%M NY"), _p(px), _p(self._r_high), _p(self._r_low), r_sz)
             return
@@ -230,11 +227,10 @@ class Strategy:
             return
 
         if self._day_done:
-            self._log.info("[heartbeat] %s  px=%s  → dia concluído (trade executado + encerrado)",
+            self._log.info("[heartbeat] %s  px=%s  → dia concluído",
                            now_ny.strftime("%H:%M NY"), _p(px))
             return
 
-        # Janela de execução
         l_trig = self._r_high * (1 + ENTRY_BUFFER_PCT / 100) if self._r_high else None
         s_trig = self._r_low  * (1 - ENTRY_BUFFER_PCT / 100) if self._r_low  else None
 
@@ -267,7 +263,6 @@ class Strategy:
         self.in_trade = self.is_be_active = False
         self.qty = self.leverage = 0.0
         self.trigger_level = self.entry_price_final = self.sl = self.tp = None
-        # Reset flags de transição
         self._logged_pre_range   = False
         self._logged_range_start = False
         self._logged_range_end   = False
@@ -316,7 +311,6 @@ class Strategy:
         if self._day != d:
             self._reset_day(d)
 
-        # Fim de semana / dia inválido
         if not self._weekday_ok(d):
             self._today_bars.append(bar)
             self._roll_atr_vol(self._today_bars)
@@ -324,18 +318,16 @@ class Strategy:
 
         bm = self._time_to_minutes(bar['start'].time())
 
-        # ── PRÉ-RANGE: log de aviso quando a primeira barra do dia chega antes do range ──
+        # Pré-range: log uma vez
         if bm < self._sr_m and not self._logged_pre_range:
             self._log.info(
                 "[transição] PRÉ-RANGE: recebendo barras do dia %s (barra atual: %s NY). "
                 "Mapeamento começa em %s NY. Nenhuma ação até lá.",
-                d.isoformat(),
-                bar['start'].strftime("%H:%M"),
-                START_RANGE,
+                d.isoformat(), bar['start'].strftime("%H:%M"), START_RANGE,
             )
             self._logged_pre_range = True
 
-        # ── MAPEAMENTO DE RANGE ────────────────────────────────────────────────
+        # ── MAPEAMENTO DE RANGE ───────────────────────────────────────────
         if self._in_range_window(bar['start']):
             if not self._logged_range_start:
                 self._log.info(
@@ -343,19 +335,16 @@ class Strategy:
                     bar['start'].strftime("%H:%M"),
                     START_RANGE,
                     (datetime.strptime(START_RANGE, '%H:%M') + timedelta(minutes=RANGE_MINUTES)).strftime('%H:%M'),
-                    RANGE_MINUTES,
-                    BASE_TF,
+                    RANGE_MINUTES, BASE_TF,
                 )
                 self._logged_range_start = True
 
-            prev_h, prev_l = self._r_high, self._r_low
             if self._r_high is None:
                 self._r_high, self._r_low = bar['h'], bar['l']
             else:
                 self._r_high = max(self._r_high, bar['h'])
                 self._r_low  = min(self._r_low,  bar['l'])
 
-            # Log de cada barra do range
             self._log.info(
                 "[range] barra %s  O=%s H=%s L=%s C=%s V=%s  |  range acumulado: [%s, %s] (%.2f pts)",
                 bar['start'].strftime("%H:%M"),
@@ -367,7 +356,7 @@ class Strategy:
         self._today_bars.append(bar)
         self._roll_atr_vol(self._today_bars)
 
-        # ── FIM DO MAPEAMENTO: valida filtros ─────────────────────────────────
+        # ── FIM DO MAPEAMENTO: barra com bm == _er_m finaliza o range ────
         if not self._range_ready and bm >= self._er_m:
             r_size = (self._r_high - self._r_low) if self._r_high is not None and self._r_low is not None else 0
 
@@ -378,7 +367,6 @@ class Strategy:
                 )
                 self._logged_range_end = True
 
-            # Validação: range vazio
             if self._r_high is None or self._r_low is None or r_size <= 0:
                 self._day_valid = False
                 self._range_ready = True
@@ -387,7 +375,6 @@ class Strategy:
                     self._logged_day_invalid = True
                 return None
 
-            # Validação: filtro ATR
             if USE_ATR_FILTER:
                 last_range_bar = next((b for b in reversed(self._today_bars[:-1]) if self._in_range_window(b['start'])), None)
                 current_atr = last_range_bar.get('atr') if last_range_bar else None
@@ -395,8 +382,7 @@ class Strategy:
                 atr_ok      = current_atr is not None and r_size >= atr_needed
                 self._log.info(
                     "[filtro] ATR: range=%.2f  ATR=%.2f  necessário≥%.2f  → %s",
-                    r_size, current_atr or 0, atr_needed,
-                    "✅ OK" if atr_ok else "❌ REPROVADO",
+                    r_size, current_atr or 0, atr_needed, "✅ OK" if atr_ok else "❌ REPROVADO",
                 )
                 if not atr_ok:
                     self._day_valid = False
@@ -408,13 +394,11 @@ class Strategy:
             else:
                 self._log.info("[filtro] ATR: desativado (off)")
 
-            # Validação: max range
             if USE_MAX_RANGE_FILTER:
                 max_ok = r_size <= MAX_RANGE_PT
                 self._log.info(
                     "[filtro] Max range: range=%.2f  máx=%.0f pts  → %s",
-                    r_size, MAX_RANGE_PT,
-                    "✅ OK" if max_ok else "❌ REPROVADO",
+                    r_size, MAX_RANGE_PT, "✅ OK" if max_ok else "❌ REPROVADO",
                 )
                 if not max_ok:
                     self._day_valid = False
@@ -426,38 +410,43 @@ class Strategy:
             else:
                 self._log.info("[filtro] Max range: desativado (off)")
 
-            # Todos os filtros passaram
             self._day_valid   = True
             self._range_ready = True
             l_trig = self._r_high * (1 + ENTRY_BUFFER_PCT / 100)
             s_trig = self._r_low  * (1 - ENTRY_BUFFER_PCT / 100)
 
             if not self._logged_exec_open:
-                self._log.info(
-                    "[transição] ✅ DIA VÁLIDO — todos os filtros aprovados. Janela de execução ABERTA."
-                )
-                self._log.info(
-                    "[execução] range=[%s, %s] (%.2f pts)  buffer=%.2f%%",
-                    _p(self._r_low), _p(self._r_high), r_size, ENTRY_BUFFER_PCT,
-                )
-                self._log.info(
-                    "[execução] gatilho LONG (breakout ↑): %s  |  gatilho SHORT (breakout ↓): %s",
-                    _p(l_trig), _p(s_trig),
-                )
-                self._log.info(
-                    "[execução] aguardando barra fechar além dos gatilhos (ENTRY_TYPE=%s, CONFIRMATION=%s)",
-                    ENTRY_TYPE, USE_CONFIRMATION_BREAK,
-                )
+                self._log.info("[transição] ✅ DIA VÁLIDO — todos os filtros aprovados. Janela de execução ABERTA.")
+                self._log.info("[execução] range=[%s, %s] (%.2f pts)  buffer=%.2f%%",
+                               _p(self._r_low), _p(self._r_high), r_size, ENTRY_BUFFER_PCT)
+                self._log.info("[execução] gatilho LONG (breakout ↑): %s  |  gatilho SHORT (breakout ↓): %s",
+                               _p(l_trig), _p(s_trig))
+                self._log.info("[execução] aguardando barra fechar além dos gatilhos (ENTRY_TYPE=%s, CONFIRMATION=%s)",
+                               ENTRY_TYPE, USE_CONFIRMATION_BREAK)
+                self._log.info("[execução] ⚠ esta barra (%s) não é elegível — sinais a partir da PRÓXIMA barra",
+                               bar['start'].strftime("%H:%M"))
                 self._logged_exec_open = True
 
-        # Só processa lógica de entrada/saída se na janela de execução
-        if not self._in_exec_window(bar['start']) or not self._day_valid:
+            # ── FIX: a barra que fecha o range (bm == _er_m) não pode gerar sinal.
+            # Ela simultaneamente finaliza o range E cairia na janela de execução
+            # (_in_exec_window retorna True para bm == _er_m). Retornar None aqui
+            # garante que só barras POSTERIORES ao fechamento do range sejam avaliadas.
+            return None
+
+        # ── GUARD: só avalia sinal se range foi fechado EM BARRA ANTERIOR ──
+        # _range_ready só é True depois que uma barra com bm >= _er_m passou,
+        # então a condição abaixo protege contra o caso de _range_ready ser setado
+        # nesta mesma chamada (o bloco acima já retorna None nesse caso).
+        if not self._range_ready or not self._day_valid:
+            return None
+
+        if not self._in_exec_window(bar['start']):
             return None
 
         return self._process_closed_bar(bar['start'], bar)
 
     # ──────────────────────────────────────────────────────────────
-    # Lógica de entrada / saída (chamada apenas na janela de exec)
+    # Lógica de entrada / saída
     # ──────────────────────────────────────────────────────────────
 
     def _process_closed_bar(self, e_idx: datetime, e_row: dict) -> dict | str | None:
@@ -468,12 +457,11 @@ class Strategy:
         vol_ma = e_row.get('vol_ma')
         ex_ma  = (self._last_market or {}).get("candle_closed_vol_ma_10")
 
-        # ── Aguardando sinal inicial ───────────────────────────────────────
+        # ── Aguardando sinal inicial ──────────────────────────────────────
         if self.pos_type is None:
             l_trig = self._r_high * (1 + ENTRY_BUFFER_PCT / 100)
             s_trig = self._r_low  * (1 - ENTRY_BUFFER_PCT / 100)
 
-            # Filtro de volume (por barra)
             if USE_VOLUME_FILTER:
                 ref    = ex_ma if ex_ma is not None else vol_ma
                 vol_ok = (v >= ref * VOLUME_MULTIPLIER) if ref is not None else False
@@ -488,7 +476,6 @@ class Strategy:
             if not vol_ok:
                 return None
 
-            # Verifica breakout
             triggered = False
             if ENTRY_TYPE == 'CLOSING':
                 if   c > l_trig: self.pos_type, triggered = 'LONG',  True
@@ -498,7 +485,6 @@ class Strategy:
                 elif l <= s_trig: self.pos_type, triggered = 'SHORT', True
 
             if triggered:
-                # Preço de referência de entrada
                 if ENTRY_PRICE_TYPE == 'PREV_CANDLE':
                     if len(self._today_bars) < 2:
                         self._log.warning("[sinal] sem barra anterior para PREV_CANDLE — ignorando")
@@ -509,7 +495,6 @@ class Strategy:
                 else:
                     self.entry_price_final = l_trig if self.pos_type == 'LONG' else s_trig
 
-                # Nível de confirmação
                 if USE_CONFIRMATION_BREAK:
                     self.trigger_level = h if self.pos_type == 'LONG' else l
                 else:
@@ -531,7 +516,7 @@ class Strategy:
                     self._logged_signal = True
             return None
 
-        # ── Confirmação da entrada ─────────────────────────────────────────
+        # ── Confirmação da entrada ────────────────────────────────────────
         if self.pos_type is not None and not self.in_trade:
             conf = (self.pos_type == 'LONG'  and h >= self.trigger_level) or \
                    (self.pos_type == 'SHORT' and l <= self.trigger_level)
@@ -582,7 +567,7 @@ class Strategy:
 
             return {'action': act, 'amount': float(self.qty)}
 
-        # ── Gestão da posição aberta ───────────────────────────────────────
+        # ── Gestão da posição aberta ──────────────────────────────────────
         if self.in_trade:
             exit_p = exit_reason = None
 
@@ -593,7 +578,6 @@ class Strategy:
                 if h >= self.sl:   exit_p, exit_reason = self.sl, "SL atingido"
                 elif l <= self.tp: exit_p, exit_reason = self.tp, "TP atingido"
 
-            # Break-even
             if exit_p is None and USE_BREAK_EVEN and not self.is_be_active:
                 dist_be    = abs(self.entry_price_final - self.sl)
                 be_trigger = (self.entry_price_final + dist_be * BE_TRIGGER_RR) if self.pos_type == 'LONG' \
@@ -604,18 +588,16 @@ class Strategy:
                     self.sl, self.is_be_active = self.entry_price_final, True
                     if not self._logged_be:
                         self._log.info(
-                            "[transição] 🔒 BREAK-EVEN ATIVADO  novo SL=%s (entrada)  gatilho era=%s",
+                            "[transição] 🔒 BREAK-EVEN ATIVADO  novo SL=%s  gatilho era=%s",
                             _p(self.sl), _p(be_trigger),
                         )
                         self._logged_be = True
 
-            # Saída por tempo
             if exit_p is None and MAX_TRADE_DURATION > 0:
                 dur_min = (e_idx - self.entry_time).total_seconds() / 60.0
                 if dur_min >= MAX_TRADE_DURATION:
-                    exit_p, exit_reason = c, f"duração máx ({MAX_TRADE_DURATION}min) expirada — {dur_min:.0f}min"
+                    exit_p, exit_reason = c, f"duração máx ({MAX_TRADE_DURATION}min) — {dur_min:.0f}min"
 
-            # Saída por EOD
             if exit_p is None and e_idx.time() >= self._eod:
                 exit_p, exit_reason = c, "fim do dia (EOD)"
 
@@ -639,7 +621,6 @@ class Strategy:
     def on_tick(self, market_data: dict) -> dict | str | None:
         self._last_market = market_data
 
-        # Atualiza equity
         eq = market_data.get('account_equity')
         if eq is not None:
             try:
@@ -653,10 +634,9 @@ class Strategy:
             return None
         px = float(px)
 
-        bstart  = self._bar_start_ny(ts, self._tfm)
-        now_ny  = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).astimezone(NY)
+        bstart = self._bar_start_ny(ts, self._tfm)
+        now_ny = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).astimezone(NY)
 
-        # Acumula volume da barra em construção
         c_cum = market_data.get('candle_base_volume')
         use_cum: float | None = None
         if c_cum is not None:
@@ -673,7 +653,6 @@ class Strategy:
                 except (TypeError, ValueError):
                     pass
 
-        # Primeiro tick
         if self._bucket is None:
             self._bucket = bstart
             self._o = self._h = self._l = self._c = px
@@ -681,18 +660,15 @@ class Strategy:
             self._heartbeat(now_ny, px)
             return None
 
-        # Barra nova: fecha a anterior e processa
         if bstart != self._bucket:
             closed = self._finalize_bar()
             out    = self._on_new_closed_bar(closed) if closed else None
-            # Abre nova barra
             self._bucket  = bstart
             self._o = self._h = self._l = self._c = px
             self._v_ticks = use_cum if use_cum is not None else v_inc
             self._heartbeat(now_ny, px)
             return out
 
-        # Intra-barra: só atualiza OHLCV
         self._h = max(self._h, px)
         self._l = min(self._l, px)
         self._c = px
