@@ -37,7 +37,7 @@ async def main() -> None:
         price += 0.5
         candle_forms += 0.0002
         p = {
-            "pair": "BTCUSDT.P",
+            "pair": "BTCUSDT",
             "price": price,
             "bid": price - 0.5,
             "ask": price + 0.5,
@@ -51,7 +51,7 @@ async def main() -> None:
             "hub_published_at_ms": int(time.time() * 1000),
             "source": "hub_v1_mock",
         }
-        n = r.publish("market_data:BTCUSDT.P", json.dumps(p))
+        n = r.publish("market_data:BTCUSDT", json.dumps(p))
         logger.info("published tick price=%.2f sub=%d", price, n)
         await asyncio.sleep(2)
 

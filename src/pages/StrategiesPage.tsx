@@ -19,9 +19,8 @@ type StrategyWithBots = {
 
 const emptyBots: BotRow[] = [];
 
-/** Bybit-style (BTCUSDT, BTCUSDT.P) or legacy CCXT BASE/QUOTE */
-const TRADING_PAIR_RE =
-  /^[A-Z0-9]{5,}$|^[A-Z0-9]{3,}\.P$|^[A-Z0-9]+\/[A-Z0-9]+(:[A-Z0-9]+)?$/;
+/** Bitcoin USDT linear perp only (Bybit); DB + Redis use this string. */
+const CANONICAL_TRADING_PAIR = "BTCUSDT";
 
 const runtimeLabel: Record<BotStatus, string> = {
   stopped: "Stopped",
@@ -55,8 +54,6 @@ const toPositiveVersion = (n: number, fallback: number) => {
   }
   return x;
 };
-
-const normalizePair = (raw: string) => raw.trim().toUpperCase();
 
 type PgishError = {
   message: string;
@@ -123,7 +120,6 @@ const StrategiesPage = () => {
   const [bForm, setBForm] = useState({
     name: "",
     versionNumber: 1,
-    tradingPair: "BTCUSDT.P",
   });
 
   const refetch = useCallback(async () => {
@@ -182,14 +178,12 @@ const StrategiesPage = () => {
       setBForm({
         name: "",
         versionNumber: botDrawer.nextVersion,
-        tradingPair: "BTCUSDT.P",
       });
     } else {
       const b = botDrawer.bot;
       setBForm({
         name: b.name,
         versionNumber: b.version_number,
-        tradingPair: b.trading_pair,
       });
     }
   }, [botDrawer]);
@@ -273,18 +267,7 @@ const StrategiesPage = () => {
     setBotSaveError(null);
     const s = getSupabaseClient()!;
     const code = botCodeRef.current?.value ?? "";
-    const pair = normalizePair(bForm.tradingPair);
-    if (!TRADING_PAIR_RE.test(pair)) {
-      const msg =
-        "Ticker must be Bybit-style: BTCUSDT or BTCUSDT.P (or legacy BASE/QUOTE). Uppercase letters/digits.";
-      setLoadError(msg);
-      setBotSaveError(msg);
-      console.warn(
-        "[algoshift Strategies/bot save] validation:pair",
-        { pair, pattern: "BTCUSDT / BTCUSDT.P" },
-      );
-      return;
-    }
+    const pair = CANONICAL_TRADING_PAIR;
     const fallbackN =
       botDrawer.mode === "create" ? botDrawer.nextVersion : botDrawer.bot.version_number;
     const versionNumber = toPositiveVersion(bForm.versionNumber, fallbackN);
@@ -294,6 +277,7 @@ const StrategiesPage = () => {
       version_number: versionNumber,
       content: code,
       trading_pair: pair,
+      market_type: "linear",
     };
     if (botDrawer.mode === "edit" && botDrawer.bot.status === "error") {
       payload.status = "stopped";
@@ -314,13 +298,11 @@ const StrategiesPage = () => {
     let saveOk = false;
     try {
       if (botDrawer.mode === "create") {
-        const insertMarket = pair.endsWith(".P") ? { market_type: "linear" as const } : {};
         const { data, error } = await s
           .from("bots")
           .insert({
             strategy_id: botDrawer.strategyId,
             status: "stopped",
-            ...insertMarket,
             ...payload,
           })
           .select("id");
@@ -525,7 +507,7 @@ const StrategiesPage = () => {
                                       {runtimeLabel[b.status]}
                                     </span>
                                     <span className="font-mono text-[11px] text-[#666]">
-                                      {b.trading_pair}
+                                      {CANONICAL_TRADING_PAIR}
                                     </span>
                                     <span className="font-mono text-[11px] text-[#666]">
                                       {(b.content || "").length.toLocaleString()} chars
@@ -760,21 +742,11 @@ const StrategiesPage = () => {
               }}
             />
           </div>
-          <div className="sm:col-span-2">
-            <label className="mb-1 block text-[12px] text-[#666]">Trading pair</label>
-            <input
-              className="w-full rounded-md border-0 bg-[#111] px-3 py-2 font-mono text-[13px] text-[#ededed] ring-1 ring-inset ring-white/[0.1] focus:outline-none focus:ring-2 focus:ring-[hsl(212,100%,48%)]"
-              value={bForm.tradingPair}
-              onChange={(e) => setBForm((f) => ({ ...f, tradingPair: e.target.value }))}
-              placeholder="BTCUSDT.P"
-            />
-          </div>
         </div>
-        <p className="mb-3 text-[11px] text-[#666]">
-          Same string Hub publishes on <span className="font-mono">market_data:…</span> (must match worker
-          subscription). <span className="font-mono">.P</span> = linear perp; plain{" "}
-          <span className="font-mono">BTCUSDT</span> uses bot <span className="font-mono">market_type</span> in DB
-          (spot vs linear). Set <span className="font-mono">market_type</span> in Supabase if needed.
+        <p className="mb-3 rounded-md bg-white/[0.04] px-3 py-2 font-mono text-[12px] text-[#aaa] ring-1 ring-inset ring-white/[0.06]">
+          Instrument: Bitcoin USDT perpetual (Bybit linear) —{" "}
+          <span className="text-[#ededed]">{CANONICAL_TRADING_PAIR}</span> / Hub+worker{" "}
+          <span className="text-[#ededed]">market_data:{CANONICAL_TRADING_PAIR}</span>
         </p>
         <p className="mb-1 text-[11px] text-[#666]">
           Order size: worker reads <span className="font-mono">signal_amount</span> /{" "}

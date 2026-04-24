@@ -200,14 +200,7 @@ class StrategyWorker:
 
         ccxt_pair = trading_pair_to_ccxt(pair, mt)
         try:
-            ohlc = (
-                await asyncio.to_thread(get_candle_volume_snapshot, ccxt_pair, self.ohlcv_timeframe)
-                if ccxt_pair
-                else {
-                    "candle_ohlcv_timeframe": self.ohlcv_timeframe,
-                    "candle_ohlcv_error": f"no CCXT symbol for trading_pair={pair!r} market_type={mt!r}",
-                }
-            )
+            ohlc = await asyncio.to_thread(get_candle_volume_snapshot, ccxt_pair, self.ohlcv_timeframe)
         except Exception as e:  # noqa: BLE001
             logger.warning("ohlcv snapshot: %s", e)
             ohlc = {"candle_ohlcv_error": str(e)}

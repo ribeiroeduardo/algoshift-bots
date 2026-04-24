@@ -14,7 +14,7 @@ select
   '00000000-0000-0000-0000-000000000001'::uuid,
   'Test Bot BTC Scalper',
   s.id,
-  'BTCUSDT.P',
+  'BTCUSDT',
   'linear',
   'stopped',
   '{"rsi_period": 14, "overbought": 70, "signal_amount": 0.001}'::jsonb,

@@ -26,6 +26,7 @@ from railway.lib.redis_client import make_redis_client
 from railway.lib.supabase_client import make_supabase_for_hub
 from railway.lib.trading_pair_ccxt import (
     base_quote_for_balance,
+    display_pair_to_ccxt_or_raise,
     normalize_trading_pair,
     trading_pair_to_ccxt,
 )
@@ -216,11 +217,7 @@ class _Hub:
         )
         while pair in self.pairs_desired:
             mt = self.pair_market.get(pair, "linear")
-            ccxt_sym = trading_pair_to_ccxt(pair, mt)
-            if not ccxt_sym:
-                logger.error("poll_ticker: no CCXT symbol for %s market_type=%s", pair, mt)
-                await asyncio.sleep(5.0)
-                continue
+            ccxt_sym = display_pair_to_ccxt_or_raise(pair, mt)
             try:
                 t = await asyncio.wait_for(self.exchange.fetch_ticker(ccxt_sym), timeout=timeout)
                 backoff = 1.0
@@ -231,8 +228,9 @@ class _Hub:
             except asyncio.TimeoutError:
                 fail_streak += 1
                 logger.warning(
-                    "poll_ticker %s: fetch_ticker timed out after %.1fs (fail=%d) sleep %.1fs",
+                    "poll_ticker display=%s ccxt=%s: fetch_ticker timed out after %.1fs (fail=%d) sleep %.1fs",
                     pair,
+                    ccxt_sym,
                     timeout,
                     fail_streak,
                     backoff,
@@ -253,7 +251,14 @@ class _Hub:
                 backoff = min(backoff * 2, 30.0)
             except Exception as e:  # noqa: BLE001
                 fail_streak += 1
-                logger.warning("poll_ticker %s: %s sleep %.1fs fail=%d", pair, e, backoff, fail_streak)
+                logger.warning(
+                    "poll_ticker display=%s ccxt=%s: %s sleep %.1fs fail=%d",
+                    pair,
+                    ccxt_sym,
+                    e,
+                    backoff,
+                    fail_streak,
+                )
                 if fail_streak >= MAX_FAIL_BEFORE_STALE and not self._stale_published:
                     self.redis.publish(
                         "market_data_stale",
@@ -277,13 +282,10 @@ class _Hub:
         while True:
             if pair not in self.pairs_desired:
                 return
+            ccxt_sym: str | None = None
             try:
                 mt = self.pair_market.get(pair, "linear")
-                ccxt_sym = trading_pair_to_ccxt(pair, mt)
-                if not ccxt_sym:
-                    logger.error("watch_ticker: no CCXT symbol for %s market_type=%s", pair, mt)
-                    await asyncio.sleep(5.0)
-                    continue
+                ccxt_sym = display_pair_to_ccxt_or_raise(pair, mt)
                 t = await self.exchange.watch_ticker(ccxt_sym)
                 backoff = 1.0
                 fail_streak = 0
@@ -301,7 +303,14 @@ class _Hub:
                     await self._poll_ticker(pair)
                     return
                 fail_streak += 1
-                logger.warning("watch_ticker %s: %s sleep %.1fs fail=%d", pair, e, backoff, fail_streak)
+                logger.warning(
+                    "watch_ticker display=%s ccxt=%s: %s sleep %.1fs fail=%d",
+                    pair,
+                    ccxt_sym,
+                    e,
+                    backoff,
+                    fail_streak,
+                )
                 if fail_streak >= MAX_FAIL_BEFORE_STALE and not self._stale_published:
                     self.redis.publish(
                         "market_data_stale",
@@ -325,8 +334,16 @@ class _Hub:
                 self.pair_market = d
                 for p in self.pairs_desired:
                     if p not in self.watch_tasks:
+                        mt0 = self.pair_market.get(p, "linear")
+                        cs = trading_pair_to_ccxt(p, mt0)
                         self.watch_tasks[p] = asyncio.create_task(self.watch_ticker(p), name=f"watch_{p}")
-                        logger.info("started watcher %s", p)
+                        logger.info(
+                            "started watcher display=%s ccxt=%s market_type=%s (Redis channel market_data:%s)",
+                            p,
+                            cs,
+                            mt0,
+                            p,
+                        )
                 for p in list(self.watch_tasks):
                     if p not in d:
                         t = self.watch_tasks.pop(p, None)
@@ -453,16 +470,14 @@ class _Hub:
 
     async def _refetch_ticker_price(self, pair: str, market_type: str) -> float | None:
         try:
-            ccxt_sym = trading_pair_to_ccxt(pair, market_type)
-            if not ccxt_sym:
-                return None
+            ccxt_sym = display_pair_to_ccxt_or_raise(pair, market_type)
             t = await self.exchange.fetch_ticker(ccxt_sym)
             last = t.get("last")
             if last is not None:
                 self.last_prices[pair] = float(last)
                 return float(last)
         except Exception as e:  # noqa: BLE001
-            logger.warning("refetch_ticker %s: %s", pair, e)
+            logger.warning("refetch_ticker display=%s: %s", pair, e)
         return None
 
     async def _balance_check(
@@ -495,9 +510,7 @@ class _Hub:
         if not side:
             raise ValueError(f"action {a}")
         pair_disp = normalize_trading_pair(str(s.get("pair") or ""))
-        ccxt_sym = trading_pair_to_ccxt(pair_disp, market_type)
-        if not ccxt_sym:
-            raise ValueError(f"no CCXT symbol for pair={pair_disp!r} market_type={market_type!r}")
+        ccxt_sym = display_pair_to_ccxt_or_raise(pair_disp, market_type)
         amt = float(s.get("amount", 0))
         t = s.get("type", "MARKET")
         p = s.get("price")
