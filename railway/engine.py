@@ -145,9 +145,9 @@ class RailwayTradingEngine:
                         version["strategy_id"],
                         version["version_number"],
                     )
-                    self.active_version_id = version["id"]
-                    # No per-version params column in schema; strategies use empty dict unless extended.
-                    self._compile_logic(version["content"], {})
+                    # Advance active_version_id only after successful compile so missing deps retry each tick.
+                    if self._compile_logic(version["content"], {}):
+                        self.active_version_id = version["id"]
                 else:
                     _trace("fetch_and_sync: same version id, skip compile")
             else:
@@ -163,8 +163,8 @@ class RailwayTradingEngine:
             _trace(f"fetch_and_sync EXC: {e!r}")
             traceback.print_exc()
 
-    def _compile_logic(self, code_str, params):
-        """Injeta dinamicamente o código Python (Opção A)."""
+    def _compile_logic(self, code_str, params) -> bool:
+        """Run injected code; return True if Strategy is ready."""
         try:
             code_len = len(code_str or "")
             _trace(f"_compile_logic: code_len={code_len} params_type={type(params).__name__}")
@@ -179,13 +179,15 @@ class RailwayTradingEngine:
                 self.strategy_instance = local_context["Strategy"](params)
                 logger.info("✅ Estratégia instanciada com sucesso.")
                 _trace("_compile_logic: Strategy() OK")
-            else:
-                logger.error("❌ Classe 'Strategy' não encontrada no código injetado.")
-                _trace("_compile_logic: no Strategy class in local_context")
+                return True
+            logger.error("❌ Classe 'Strategy' não encontrada no código injetado.")
+            _trace("_compile_logic: no Strategy class in local_context")
+            return False
         except Exception as e:
             logger.error(f"Falha na compilação dinâmica: {e}")
             _trace(f"_compile_logic EXC: {e!r}")
             traceback.print_exc()
+            return False
 
     async def run_loop(self):
         _trace("run_loop: entered")
