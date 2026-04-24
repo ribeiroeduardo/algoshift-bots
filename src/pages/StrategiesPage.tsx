@@ -4,9 +4,10 @@ import { Link } from "react-router-dom";
 import { DashboardLayout } from "@/components/dashboard/DashboardLayout";
 import { Drawer } from "@/components/ui/Drawer";
 import { Modal } from "@/components/ui/Modal";
+import { updateBotRuntimeStatus } from "@/lib/botStatusUpdate";
 import { getSupabaseClient, isSupabaseEnabled } from "@/lib/supabaseClient";
 import { cn } from "@/lib/utils";
-import type { BotCodeStatus, BotRow, BotStatus } from "@/types/database";
+import type { BotRow, BotStatus } from "@/types/database";
 
 type StrategyWithBots = {
   id: string;
@@ -20,29 +21,11 @@ const emptyBots: BotRow[] = [];
 
 const PAIR_RE = /^[A-Z0-9]+\/[A-Z0-9]+$/;
 
-const codeStatusLabel: Record<BotCodeStatus, string> = {
-  draft: "Draft",
-  active: "Active",
-  archived: "Archived",
-};
-
 const runtimeLabel: Record<BotStatus, string> = {
   stopped: "Stopped",
   running: "Running",
   paused: "Paused",
   error: "Error",
-};
-
-const codeStatusBadge = (s: BotCodeStatus) => {
-  const base =
-    "inline-flex items-center rounded-full px-1.5 py-0.5 text-[11px] font-medium";
-  if (s === "active") {
-    return cn(base, "bg-emerald-500/12 text-emerald-300");
-  }
-  if (s === "archived") {
-    return cn(base, "bg-white/[0.08] text-[#666]");
-  }
-  return cn(base, "bg-amber-500/12 text-amber-200/90");
 };
 
 const runtimeBadge = (s: BotStatus) => {
@@ -73,10 +56,49 @@ const toPositiveVersion = (n: number, fallback: number) => {
 
 const normalizePair = (raw: string) => raw.trim().toUpperCase();
 
+type PgishError = {
+  message: string;
+  code?: string;
+  details?: string;
+  hint?: string;
+};
+
+const formatPostgrestError = (e: PgishError) => {
+  const parts = [e.message];
+  if (e.hint) {
+    parts.push(`hint: ${e.hint}`);
+  }
+  if (e.details) {
+    parts.push(`details: ${e.details}`);
+  }
+  if (e.code) {
+    parts.push(`code: ${e.code}`);
+  }
+  return parts.join(" | ");
+};
+
+/** DevTools → Console: full Supabase/PostgREST errors when save fails */
+const logBotSave = (
+  step: "start" | "insert_ok" | "update_ok" | "insert_fail" | "update_fail" | "exception",
+  ctx: Record<string, unknown>,
+) => {
+  const tag = "[algoshift Strategies/bot save]";
+  if (step === "start") {
+    console.info(tag, step, ctx);
+    return;
+  }
+  if (step.endsWith("_ok")) {
+    console.info(tag, step, ctx);
+    return;
+  }
+  console.error(tag, step, ctx);
+};
+
 const StrategiesPage = () => {
   const supa = isSupabaseEnabled();
   const [rows, setRows] = useState<StrategyWithBots[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [botSaveError, setBotSaveError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [openStrategyIds, setOpenStrategyIds] = useState<Set<string>>(() => new Set());
 
@@ -99,7 +121,6 @@ const StrategiesPage = () => {
   const [bForm, setBForm] = useState({
     name: "",
     versionNumber: 1,
-    codeStatus: "draft" as BotCodeStatus,
     tradingPair: "BTC/USDT",
   });
 
@@ -114,7 +135,7 @@ const StrategiesPage = () => {
       .from("strategies")
       .select(
         `id, name, created_at, updated_at,
-         bots ( id, name, strategy_id, content, version_number, code_status, trading_pair, exchange, market_type, status, params, last_error, created_at, updated_at )`,
+         bots ( id, name, strategy_id, content, version_number, trading_pair, exchange, market_type, status, params, last_error, created_at, updated_at )`,
       )
       .order("updated_at", { ascending: false });
     setLoading(false);
@@ -159,7 +180,6 @@ const StrategiesPage = () => {
       setBForm({
         name: "",
         versionNumber: botDrawer.nextVersion,
-        codeStatus: "draft",
         tradingPair: "BTC/USDT",
       });
     } else {
@@ -167,7 +187,6 @@ const StrategiesPage = () => {
       setBForm({
         name: b.name,
         versionNumber: b.version_number,
-        codeStatus: b.code_status,
         tradingPair: b.trading_pair,
       });
     }
@@ -249,47 +268,97 @@ const StrategiesPage = () => {
       return;
     }
     setLoadError(null);
+    setBotSaveError(null);
     const s = getSupabaseClient()!;
     const code = botCodeRef.current?.value ?? "";
     const pair = normalizePair(bForm.tradingPair);
     if (!PAIR_RE.test(pair)) {
-      setLoadError("Trading pair must look like BTC/USDT (uppercase letters and digits).");
+      const msg = "Trading pair must look like BTC/USDT (uppercase letters and digits).";
+      setLoadError(msg);
+      setBotSaveError(msg);
+      console.warn(
+        "[algoshift Strategies/bot save] validation:pair",
+        { pair, pattern: "BTC/USDT" },
+      );
       return;
     }
     const fallbackN =
       botDrawer.mode === "create" ? botDrawer.nextVersion : botDrawer.bot.version_number;
     const versionNumber = toPositiveVersion(bForm.versionNumber, fallbackN);
     const name = bForm.name.trim() || `Bot v${versionNumber}`;
-    const payload = {
+    const payload: Record<string, unknown> = {
       name,
       version_number: versionNumber,
       content: code,
-      code_status: bForm.codeStatus,
       trading_pair: pair,
     };
-    if (botDrawer.mode === "create") {
-      const { error } = await s.from("bots").insert({
-        strategy_id: botDrawer.strategyId,
-        status: "stopped",
-        ...payload,
-      });
-      if (error) {
-        setLoadError(
-          [error.message, (error as { details?: string }).details].filter(Boolean).join(" — "),
-        );
-        return;
-      }
-    } else {
-      const { error } = await s.from("bots").update(payload).eq("id", botDrawer.bot.id);
-      if (error) {
-        setLoadError(
-          [error.message, (error as { details?: string }).details].filter(Boolean).join(" — "),
-        );
-        return;
-      }
+    if (botDrawer.mode === "edit" && botDrawer.bot.status === "error") {
+      payload.status = "stopped";
+      payload.last_error = null;
+      payload.last_error_at = null;
     }
-    setBotDrawer(null);
-    void refetch();
+    const botId = botDrawer.mode === "edit" ? botDrawer.bot.id : null;
+    logBotSave("start", {
+      mode: botDrawer.mode,
+      strategyId: botDrawer.strategyId,
+      botId,
+      contentChars: code.length,
+      pair,
+      versionNumber,
+      name,
+      clearErrorToStopped: botDrawer.mode === "edit" && botDrawer.bot.status === "error",
+    });
+    let saveOk = false;
+    try {
+      if (botDrawer.mode === "create") {
+        const { data, error } = await s
+          .from("bots")
+          .insert({
+            strategy_id: botDrawer.strategyId,
+            status: "stopped",
+            ...payload,
+          })
+          .select("id");
+        if (error) {
+          const msg = formatPostgrestError(error);
+          setLoadError(msg);
+          setBotSaveError(msg);
+          logBotSave("insert_fail", { error, data, devtools: "F12 → Console → [algoshift" });
+        } else {
+          logBotSave("insert_ok", { id: data?.[0]?.id, contentChars: code.length });
+          saveOk = true;
+        }
+      } else {
+        const { data, error } = await s
+          .from("bots")
+          .update(payload)
+          .eq("id", botDrawer.bot.id)
+          .select("id, status, updated_at, last_error");
+        if (error) {
+          const msg = formatPostgrestError(error);
+          setLoadError(msg);
+          setBotSaveError(msg);
+          logBotSave("update_fail", {
+            botId: botDrawer.bot.id,
+            error,
+            data,
+            devtools: "F12 → Console → [algoshift",
+          });
+        } else {
+          logBotSave("update_ok", { botId: botDrawer.bot.id, row: data?.[0] });
+          saveOk = true;
+        }
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setLoadError(msg);
+      setBotSaveError(msg);
+      logBotSave("exception", { err: e });
+    }
+    if (saveOk) {
+      setBotDrawer(null);
+      void refetch();
+    }
   };
 
   const setBotStatus = async (botId: string, status: BotStatus) => {
@@ -297,10 +366,10 @@ const StrategiesPage = () => {
       return;
     }
     setLoadError(null);
-    const s = getSupabaseClient()!;
-    const { error } = await s.from("bots").update({ status }).eq("id", botId);
-    if (error) {
-      setLoadError(error.message);
+    console.info("[algoshift Strategies] setBotStatus click", { botId, to: status });
+    const res = await updateBotRuntimeStatus(botId, status);
+    if (!res.ok) {
+      setLoadError(res.message);
       return;
     }
     void refetch();
@@ -323,12 +392,14 @@ const StrategiesPage = () => {
   };
 
   const openNewBot = (st: StrategyWithBots) => {
+    setBotSaveError(null);
     const maxN =
       st.bots.length > 0 ? Math.max(...st.bots.map((b) => b.version_number)) : 0;
     setBotDrawer({ mode: "create", strategyId: st.id, nextVersion: maxN + 1 || 1 });
   };
 
   const openBotForEdit = (strategyId: string, bot: BotRow) => {
+    setBotSaveError(null);
     setBotDrawer({ mode: "edit", strategyId, bot });
   };
 
@@ -445,9 +516,6 @@ const StrategiesPage = () => {
                                 <div className="min-w-0 flex-1">
                                   <div className="truncate font-medium text-[#ededed]">{b.name}</div>
                                   <div className="mb-0.5 mt-0.5 flex flex-wrap items-center gap-2">
-                                    <span className={codeStatusBadge(b.code_status)}>
-                                      {codeStatusLabel[b.code_status]}
-                                    </span>
                                     <span className={runtimeBadge(b.status)}>
                                       {runtimeLabel[b.status]}
                                     </span>
@@ -461,6 +529,12 @@ const StrategiesPage = () => {
                                   <p className="text-[11px] text-[#666]">
                                     <span className="font-mono text-[10px] text-[#555]">{b.id}</span>
                                   </p>
+                                  {b.status === "error" && (
+                                    <p className="mt-1 text-[11px] text-amber-400/90">
+                                      Em erro: grava o código (Save) — fica Stopped e limpa o erro — depois Start
+                                      para Running. Ou só Start se o código já estiver ok.
+                                    </p>
+                                  )}
                                 </div>
                                 <div className="flex shrink-0 flex-col items-end gap-1.5 sm:flex-row sm:items-center">
                                   <div className="flex flex-wrap justify-end gap-1">
@@ -620,6 +694,7 @@ const StrategiesPage = () => {
         onOpenChange={(o) => {
           if (!o) {
             setBotDrawer(null);
+            setBotSaveError(null);
           }
         }}
         widthClassName="w-full max-w-5xl"
@@ -639,7 +714,20 @@ const StrategiesPage = () => {
           </div>
         }
       >
-        <div className="mb-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
+        {botSaveError && (
+          <div className="mb-3 rounded-md border border-rose-500/30 bg-rose-950/40 px-3 py-2 text-[12px] text-rose-200/95">
+            <p className="font-medium text-rose-100/95">Falha ao salvar (ver Consola: F12 → aba Consola, filtrar "algoshift")</p>
+            <p className="mt-1 whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-rose-200/90">
+              {botSaveError}
+            </p>
+          </div>
+        )}
+        <p className="mb-2 text-[11px] text-[#666]">
+          Dica de debug: com o drawer aberto, <span className="font-mono">Save</span> e um erro: DevTools
+          (⌥⌘I) → <span className="font-mono">Console</span> → procura{" "}
+          <span className="font-mono text-[#aaa]">[algoshift Strategies/bot save]</span>.
+        </p>
+        <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
             <label className="mb-1 block text-[12px] text-[#666]">Name</label>
             <input
@@ -667,21 +755,7 @@ const StrategiesPage = () => {
               }}
             />
           </div>
-          <div>
-            <label className="mb-1 block text-[12px] text-[#666]">Code status</label>
-            <select
-              className="h-[38px] w-full rounded-md border-0 bg-[#111] px-2 text-[13px] text-[#ededed] ring-1 ring-inset ring-white/[0.1] focus:outline-none focus:ring-2 focus:ring-[hsl(212,100%,48%)]"
-              value={bForm.codeStatus}
-              onChange={(e) =>
-                setBForm((f) => ({ ...f, codeStatus: e.target.value as BotCodeStatus }))
-              }
-            >
-              <option value="draft">Draft</option>
-              <option value="active">Active</option>
-              <option value="archived">Archived</option>
-            </select>
-          </div>
-          <div className="sm:col-span-3">
+          <div className="sm:col-span-2">
             <label className="mb-1 block text-[12px] text-[#666]">Trading pair</label>
             <input
               className="w-full rounded-md border-0 bg-[#111] px-3 py-2 font-mono text-[13px] text-[#ededed] ring-1 ring-inset ring-white/[0.1] focus:outline-none focus:ring-2 focus:ring-[hsl(212,100%,48%)]"

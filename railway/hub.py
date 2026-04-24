@@ -138,17 +138,27 @@ class _Hub:
             prev = self._poll_log_at.get(pair, 0.0)
             if ts - prev >= POLL_LOG_INTERVAL_SEC:
                 self._poll_log_at[pair] = ts
-                logger.info("market_data %s price=%.2f bid=%s ask=%s (rest poll)", pair, last_f, bid, ask)
+                logger.info(
+                    "market_data %s price=%.2f bid=%s ask=%s (rest poll; kline/candle vol is fetched in worker)",
+                    pair,
+                    last_f,
+                    bid,
+                    ask,
+                )
             logger.debug("market_data %s price=%.2f (rest poll)", pair, last_f)
-        last_qty = t.get("baseVolume")
-        if last_qty is None and isinstance(t.get("info"), dict):
-            last_qty = t.get("info", {}).get("baseVol")
+        info = t.get("info") if isinstance(t.get("info"), dict) else {}
+        last_tr_base = _f(
+            t.get("lastTraded")
+            or t.get("lastTradeAmount")
+            or info.get("lastTraded")
+            or info.get("size")
+        )
         payload = {
             "pair": pair,
             "price": last_f,
             "bid": bid,
             "ask": ask,
-            "last_qty": _f(last_qty) if last_qty is not None else None,
+            "last_qty": last_tr_base,
             "timestamp_ms": int(t.get("timestamp") or now_ms),
             "hub_published_at_ms": now_ms,
             "source": source,

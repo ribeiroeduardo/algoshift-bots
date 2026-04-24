@@ -19,7 +19,8 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from railway.lib.bot_params import resolve_signal_amount
-from railway.lib.bybit_balance import get_cached_equity_sync
+from railway.lib.bybit_balance import get_cached_equity_sync, has_bybit_api_credentials
+from railway.lib.bybit_ohlcv import get_candle_volume_snapshot
 from railway.lib.redis_client import make_redis_client
 from railway.lib.strategy_loader import load_strategy_from_db
 from railway.lib.supabase_client import make_supabase_for_worker
@@ -37,6 +38,17 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - [WORKER] %(message)s", force=True
 )
 logger = logging.getLogger("worker")
+
+FEED_LOG_SEC = float((os.getenv("WORKER_FEED_LOG_SEC") or "30.0").strip() or "30.0")
+
+
+def _to_f(x) -> float | None:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
 
 def _iso_from_ms(ms: int) -> str:
@@ -69,13 +81,16 @@ class StrategyWorker:
         self._q: asyncio.Queue | None = None
         self._q_status: asyncio.Queue | None = None
         self._last_strategy_error: str | None = None
+        self._last_feed_log_m: float = 0.0
+        self.ohlcv_timeframe = (os.getenv("WORKER_OHLCV_TIMEFRAME") or "15m").strip() or "15m"
+        self._warned_no_bybit: bool = False
 
     async def reload(self) -> None:
         r = (
             self.supabase.table("bots")
             .select(
                 "id, name, strategy_id, trading_pair, status, "
-                "params, last_error, content, code_status, version_number"
+                "params, last_error, content, version_number"
             )
             .eq("id", self.bot_id)
             .limit(1)
@@ -101,7 +116,10 @@ class StrategyWorker:
                 self._compile_key = None
         st = (self.bot_row.get("status") or "").lower()
         if st == "error":
-            logger.info("bot %s -> error exit", self.bot_id)
+            logger.info(
+                "bot %s -> error exit: status=error in DB. Set to stopped or running in Strategies UI / Supabase, then restart worker.",
+                self.bot_id,
+            )
             os._exit(0)
         # stopped: keep process up so UI "Start" (status=running) works without redeploy
 
@@ -160,7 +178,23 @@ class StrategyWorker:
         except Exception as e:  # noqa: BLE001
             logger.debug("account_equity: %s", e)
             account_equity = None
-        md = {
+
+        try:
+            ohlc = await asyncio.to_thread(
+                get_candle_volume_snapshot, pair, self.ohlcv_timeframe
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ohlcv snapshot: %s", e)
+            ohlc = {"candle_ohlcv_error": str(e)}
+
+        if not has_bybit_api_credentials() and not self._warned_no_bybit:
+            self._warned_no_bybit = True
+            logger.warning(
+                "No BYBIT_API_KEY / BYBIT_API_SECRET in this process: account_equity=n/a. "
+                "Set the same Bybit (demo) keys on the *worker* process to log balance in [feed] "
+                "(HUB only streams prices — balance is never in Hub logs).",
+            )
+        md: dict = {
             "price": t.get("price"),
             "bid": t.get("bid"),
             "ask": t.get("ask"),
@@ -168,8 +202,36 @@ class StrategyWorker:
             "last_qty": t.get("last_qty"),
             "account_equity": account_equity,
         }
+        md.update(ohlc)
         if md["price"] is None:
             return
+
+        now_m = time.monotonic()
+        if self.ticks == 1 or (now_m - self._last_feed_log_m) >= FEED_LOG_SEC:
+            self._last_feed_log_m = now_m
+            eqs = f"{float(account_equity):.4f}" if account_equity is not None else "n/a"
+            cbf = ohlc.get("candle_base_volume")
+            cbd = ohlc.get("candle_base_volume_delta")
+            ma10 = ohlc.get("candle_closed_vol_ma_10")
+            t_open = ohlc.get("candle_open_time_ms")
+            base_sym = (pair or "BTC/USDT").split("/")[0]
+            err = ohlc.get("candle_ohlcv_error")
+            if err and self.ticks < 3:
+                logger.warning("[ohlcv] %s", err)
+            logger.info(
+                "[feed] %s price=%s ohlcv_tf=%s t_open=%s %s_forms_cum=%s dV_on_fetch=%s "
+                "closed10_MA=%s balance_%s=%s (Bybit: kline vol + balance only on WORKER; Hub=price only)",
+                pair,
+                md.get("price"),
+                self.ohlcv_timeframe,
+                t_open,
+                base_sym,
+                f"{cbf:.6f}" if cbf is not None else "n/a",
+                f"{cbd:.8f}" if cbd is not None else "n/a",
+                f"{ma10:.6f}" if ma10 is not None else "n/a",
+                quote,
+                eqs,
+            )
         try:
             raw_sig = self.strategy.on_tick(md)
         except Exception as e:  # noqa: BLE001
@@ -304,6 +366,15 @@ class StrategyWorker:
         await self.reload()
         if not self.bot_row:
             raise RuntimeError("no bot")
+        if has_bybit_api_credentials():
+            logger.info(
+                "Worker: Bybit keys found — [feed] will show balance in quote; ohlcv_tf=%s (Bybit kline base vol).",
+                self.ohlcv_timeframe,
+            )
+        else:
+            logger.warning(
+                "Worker: no Bybit API keys in env — account_equity=n/a. HUB never logs balance; add keys to the worker process.",
+            )
         if self.strategy is None:
             msg = self._last_strategy_error or "unknown compile error"
             logger.error(

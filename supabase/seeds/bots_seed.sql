@@ -7,8 +7,7 @@ insert into public.bots (
   status,
   params,
   content,
-  version_number,
-  code_status
+  version_number
 )
 select
   '00000000-0000-0000-0000-000000000001'::uuid,
@@ -18,8 +17,7 @@ select
   'stopped',
   '{"rsi_period": 14, "overbought": 70, "signal_amount": 0.001}'::jsonb,
   E'# placeholder — replace in Strategies UI\nclass Strategy:\n    def __init__(self, params):\n        self.p = params\n    def on_tick(self, market_data):\n        return None\n',
-  1,
-  'active'::public.strategy_version_status
+  1
 from public.strategies s
 order by s.created_at
 limit 1

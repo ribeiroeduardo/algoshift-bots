@@ -1,6 +1,3 @@
-/** Lifecycle for bot code (draft / active / archived). Postgres enum: strategy_version_status */
-export type BotCodeStatus = "draft" | "active" | "archived";
-
 export type BotStatus = "stopped" | "running" | "paused" | "error";
 
 export type StrategyRow = {
@@ -17,7 +14,6 @@ export type BotRow = {
   strategy_id: string;
   content: string;
   version_number: number;
-  code_status: BotCodeStatus;
   trading_pair: string;
   exchange: string;
   market_type: "spot" | "linear" | "inverse";
@@ -93,7 +89,6 @@ export type Database = {
           strategy_id: string;
           content?: string;
           version_number?: number;
-          code_status?: BotCodeStatus;
           trading_pair: string;
           exchange?: string;
           market_type?: "spot" | "linear" | "inverse";
@@ -110,7 +105,6 @@ export type Database = {
           strategy_id?: string;
           content?: string;
           version_number?: number;
-          code_status?: BotCodeStatus;
           trading_pair?: string;
           exchange?: string;
           market_type?: "spot" | "linear" | "inverse";
@@ -203,7 +197,6 @@ export type Database = {
     Views: EmptyObject;
     Functions: EmptyObject;
     Enums: {
-      strategy_version_status: BotCodeStatus;
       bot_status: BotStatus;
     };
     CompositeTypes: EmptyObject;

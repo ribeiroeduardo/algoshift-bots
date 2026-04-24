@@ -32,14 +32,21 @@ async def main() -> None:
     r = make_redis_client()
     threading.Thread(target=_signal_listener, args=(r,), daemon=True).start()
     price = 65000.0
+    candle_forms = 0.0
     while True:
         price += 0.5
+        candle_forms += 0.0002
         p = {
             "pair": "BTC/USDT",
             "price": price,
             "bid": price - 0.5,
             "ask": price + 0.5,
             "last_qty": None,
+            "candle_ohlcv_timeframe": "15m",
+            "candle_open_time_ms": int((time.time() // 900) * 900 * 1000),
+            "candle_base_volume": candle_forms,
+            "candle_base_volume_delta": 0.0002,
+            "candle_closed_vol_ma_10": 1.0,
             "timestamp_ms": int(time.time() * 1000),
             "hub_published_at_ms": int(time.time() * 1000),
             "source": "hub_v1_mock",

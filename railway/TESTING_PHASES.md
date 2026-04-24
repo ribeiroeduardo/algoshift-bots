@@ -212,19 +212,21 @@ Expect: `tick#...`; every 5th tick a BUY; Terminal A shows `SIGNAL: {...}` JSON.
 
 ## Phase 4 — End-to-end execution (real Hub consumes `order_signals`)
 
-**Goal:** Same as production: Worker emits valid signal → Hub dedupes, checks risk + balance, places order (testnet first) → row in `trades`.
+**Goal:** Same as production: Worker emits valid signal → Hub dedupes, checks risk + balance, places order **on Bybit** → row in `trades`. **Use the Bybit [Demo Trading](https://bybit-exchange.github.io/docs/v5/demo) account first** (virtual balance, `api-demo.*` keys, `BYBIT_USE_DEMO=true`); that matches the usual path from Phases 2–3. [Testnet](https://testnet.bybit.com) is an alternative for a separate set of keys (`BYBIT_USE_TESTNET=true`); Demo ≠ testnet — wrong flag → signature errors (`retCode` 10004).
 
 ### Steps
 
-1. Run **real** Hub (`python -m railway.hub`) with the same `REDIS_URL` and service-role Supabase, Bybit testnet keys, `BYBIT_USE_TESTNET=true`.
+1. Run **real** Hub (`python -m railway.hub`) with the same `REDIS_URL` and service-role Supabase, plus Bybit creds for the environment you chose:
+   - **Demo (recommended for first live execution):** [Demo](https://www.bybit.com/app/user/api-management) / `api-demo.*` keys, **`BYBIT_USE_DEMO=true`**, and leave `BYBIT_USE_TESTNET` unset.
+   - **Testnet (optional):** testnet keys, **`BYBIT_USE_TESTNET=true`**, and leave `BYBIT_USE_DEMO` unset.
 
-2. Run **real** Worker for a `running` bot with `params.signal_amount` set and a strategy that occasionally returns `BUY` (or test with a one-off—careful in prod).
+2. Run **real** Worker (Phase 3 env). If you use optional Bybit keys on the worker for **balance** sizing, match the Hub’s Demo vs testnet flags and keys. Set `params.signal_amount` and a strategy that occasionally returns `BUY` (or test with a one-off; avoid accidental size on a funded account).
 
 3. **Dup test:** not easy without tooling; duplicate `signal_id` in Hub is ignored and logged (`duplicate signal ignored`).
 
 4. **Risk tests:** send manual signals via `redis-cli` only if you understand the JSON (usually you rely on strategy). Hub enforces optional caps from `bots.params` when those keys are set.
 
-5. **Verify:** Bybit testnet “open orders / trades” and:
+5. **Verify:** Bybit **Demo** (or testnet) “open orders / trades” in the UI for the same environment, and:
 
    ```sql
    select signal_id, status, preco_entrada, exchange_order_id
@@ -234,7 +236,7 @@ Expect: `tick#...`; every 5th tick a BUY; Terminal A shows `SIGNAL: {...}` JSON.
    limit 5;
    ```
 
-**Pass/fail:** No duplicate `signal_id` in DB; rejected cases logged; testnet order visible; `trades` row with `status = 'OPEN'` for successful opens.
+**Pass/fail:** No duplicate `signal_id` in DB; rejected cases logged; Demo (or testnet) order visible in the matching Bybit environment; `trades` row with `status = 'OPEN'` for successful opens.
 
 ---
 
@@ -264,7 +266,7 @@ Expect: `tick#...`; every 5th tick a BUY; Terminal A shows `SIGNAL: {...}` JSON.
 | 1 | `REDIS_URL` (hosted) → `python -m railway.hub_v1` + `python -m railway.worker_v1` |
 | 2 | `python -m railway.hub` + DB `bots` running + same `REDIS_URL` |
 | 3 | `python -m railway.worker` + same `REDIS_URL` + `BOT_ID` |
-| 4 | Hub + Worker + testnet; check `trades` + Bybit |
+| 4 | Hub + Worker + Demo (or testnet); same `BYBIT_*` flags as Phase 2; check `trades` + Bybit |
 | 5 | Hub + Worker + `npm run dev` Home page |
 
 **Redis spy** (if `redis-cli` supports your URL; add `--tls` for `rediss://` as needed):

@@ -224,20 +224,18 @@ class RailwayTradingEngine:
         self.start_time = datetime.now()
 
     async def fetch_and_sync_strategy(self):
-        """Load active code from public.bots (code_status = active)."""
+        """Load code from public.bots (STRATEGY_ID: latest by version, running)."""
         try:
-            _trace("fetch_and_sync: query bots code_status=active")
-            q = self.supabase.table("bots").select(
-                "id, strategy_id, version_number, content, code_status"
-            ).eq("code_status", "active")
+            _trace("fetch_and_sync: query bots status=running when strategy_id, else by bot id")
+            q = self.supabase.table("bots").select("id, strategy_id, version_number, content, status")
             strategy_id = os.getenv("STRATEGY_ID")
             bot_id = os.getenv("BOT_ID")
             if bot_id:
                 q = q.eq("id", bot_id)
                 _trace(f"fetch_and_sync: filter bot_id={bot_id!r}")
             elif strategy_id:
-                q = q.eq("strategy_id", strategy_id)
-                _trace(f"fetch_and_sync: filter strategy_id={strategy_id!r}")
+                q = q.eq("strategy_id", strategy_id).eq("status", "running")
+                _trace(f"fetch_and_sync: filter strategy_id={strategy_id!r} status=running")
             response = q.order("version_number", desc=True).limit(1).execute()
             n = len(response.data or [])
             _trace(f"fetch_and_sync: rows={n} active_bot_id={self.active_version_id!r}")
@@ -258,11 +256,11 @@ class RailwayTradingEngine:
                     _trace("fetch_and_sync: same bot id, skip compile")
             else:
                 logger.warning(
-                    "Nenhum bot com code_status=active (STRATEGY_ID / BOT_ID set? %s / %s)",
+                    "Nenhum bot (running para STRATEGY_ID, ou BOT_ID) — ver env STRATEGY_ID / BOT_ID: %s / %s",
                     bool(strategy_id),
                     bool(bot_id),
                 )
-                _trace("fetch_and_sync: empty (bots, code_status active)")
+                _trace("fetch_and_sync: empty")
         except Exception as e:
             logger.error(f"Erro ao sincronizar com Supabase: {e}")
             _trace(f"fetch_and_sync EXC: {e!r}")

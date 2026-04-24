@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Bot } from "lucide-react";
 import { Link } from "react-router-dom";
 import { DashboardLayout } from "@/components/dashboard/DashboardLayout";
+import { updateBotRuntimeStatus } from "@/lib/botStatusUpdate";
 import { getSupabaseClient, isSupabaseEnabled } from "@/lib/supabaseClient";
 import { cn } from "@/lib/utils";
 import type { BotRow, BotStatus } from "@/types/database";
@@ -52,15 +53,10 @@ const statusLabel: Record<BotStatus, string> = {
   error: "Error",
 };
 
-const setStatus = (botId: string, s: BotStatus) => {
-  const c = getSupabaseClient();
-  if (!c) return Promise.resolve();
-  return c.from("bots").update({ status: s } as { status: BotStatus }).eq("id", botId);
-};
-
 const HomePage = () => {
   const [rows, setRows] = useState<BotWithHb[]>([]);
   const [loading, setLoading] = useState(true);
+  const [actionError, setActionError] = useState<string | null>(null);
   const enabled = isSupabaseEnabled();
   const load = useCallback(async () => {
     if (!getSupabaseClient()) {
@@ -115,6 +111,11 @@ const HomePage = () => {
     <DashboardLayout title="Home">
       <div className="flex min-h-0 flex-col gap-3 p-4 text-[13px]">
         <h1 className="text-sm font-medium text-[#ededed]">Bots</h1>
+        {actionError && (
+          <p className="rounded border border-rose-500/40 bg-rose-950/30 px-2 py-1.5 text-xs text-rose-200/95">
+            {actionError} — veja a consola (F12) para <span className="font-mono">[algoshift bot status]</span>
+          </p>
+        )}
         {loading && <p className="text-[#919191]">Loading…</p>}
         {!loading && rows.length === 0 && (
           <div
@@ -163,8 +164,12 @@ const HomePage = () => {
                     <ActBtn
                       onClick={() => {
                         void (async () => {
-                          const r = setStatus(b.id, "running");
-                          if (r) await r;
+                          setActionError(null);
+                          const res = await updateBotRuntimeStatus(b.id, "running");
+                          if (!res.ok) {
+                            setActionError(res.message);
+                            return;
+                          }
                           await load();
                         })();
                       }}
@@ -177,8 +182,12 @@ const HomePage = () => {
                       <ActBtn
                         onClick={() => {
                           void (async () => {
-                            const r = setStatus(b.id, "paused");
-                            if (r) await r;
+                            setActionError(null);
+                            const res = await updateBotRuntimeStatus(b.id, "paused");
+                            if (!res.ok) {
+                              setActionError(res.message);
+                              return;
+                            }
                             await load();
                           })();
                         }}
@@ -189,8 +198,12 @@ const HomePage = () => {
                         className="border-rose-500/50 text-rose-200 hover:bg-rose-500/20"
                         onClick={() => {
                           void (async () => {
-                            const r = setStatus(b.id, "stopped");
-                            if (r) await r;
+                            setActionError(null);
+                            const res = await updateBotRuntimeStatus(b.id, "stopped");
+                            if (!res.ok) {
+                              setActionError(res.message);
+                              return;
+                            }
                             await load();
                           })();
                         }}
@@ -204,8 +217,12 @@ const HomePage = () => {
                       <ActBtn
                         onClick={() => {
                           void (async () => {
-                            const r = setStatus(b.id, "running");
-                            if (r) await r;
+                            setActionError(null);
+                            const res = await updateBotRuntimeStatus(b.id, "running");
+                            if (!res.ok) {
+                              setActionError(res.message);
+                              return;
+                            }
                             await load();
                           })();
                         }}
@@ -216,8 +233,12 @@ const HomePage = () => {
                         className="border-rose-500/50 text-rose-200 hover:bg-rose-500/20"
                         onClick={() => {
                           void (async () => {
-                            const r = setStatus(b.id, "stopped");
-                            if (r) await r;
+                            setActionError(null);
+                            const res = await updateBotRuntimeStatus(b.id, "stopped");
+                            if (!res.ok) {
+                              setActionError(res.message);
+                              return;
+                            }
                             await load();
                           })();
                         }}

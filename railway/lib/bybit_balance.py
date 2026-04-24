@@ -82,6 +82,27 @@ def _get_exchange() -> Any | None:
         return _exchange
 
 
+def get_sync_bybit() -> Any | None:
+    """Same instance as `fetch_balance` / ohlcv when API keys are set; else `None` (public ohlcv uses its own)."""
+    return _get_exchange()
+
+
+def has_bybit_api_credentials() -> bool:
+    k = _first_env(
+        "BYBIT_API_KEY",
+        "VITE_BYBIT_API_KEY",
+        "BYBIT_API_KEY_DEMO",
+        "VITE_BYBIT_API_KEY_DEMO",
+    )
+    s = _first_env(
+        "BYBIT_API_SECRET",
+        "VITE_BYBIT_API_SECRET",
+        "BYBIT_API_SECRET_DEMO",
+        "VITE_BYBIT_API_SECRET_DEMO",
+    )
+    return bool(k and s)
+
+
 def _total_in_quote(bal: dict, quote: str) -> float | None:
     q = bal.get(quote)
     if isinstance(q, dict):
@@ -89,6 +110,14 @@ def _total_in_quote(bal: dict, quote: str) -> float | None:
         if t is not None:
             try:
                 return float(t)
+            except (TypeError, ValueError):
+                pass
+        fr, us = q.get("free"), q.get("used")
+        if fr is not None and us is not None:
+            try:
+                v = float(fr) + float(us)
+                if v > 0:
+                    return v
             except (TypeError, ValueError):
                 pass
     totals = bal.get("total")
@@ -101,20 +130,33 @@ def _total_in_quote(bal: dict, quote: str) -> float | None:
 
 
 def fetch_total_equity_sync(quote: str) -> float | None:
+    global _logged_balance_dump
     ex = _get_exchange()
     if ex is None:
         return None
     q = quote.upper()
     bal = ex.fetch_balance()
     v = _total_in_quote(bal, q)
-    if v is None:
-        logger.warning("[balance] no total for quote=%s in fetch_balance keys", q)
+    if v is None and not _logged_balance_dump:
+        _logged_balance_dump = True
+        if isinstance(bal, dict):
+            logger.warning(
+                "[balance] no %s total; balance top-level keys=%s (set BYBIT keys on the worker process for [feed] balance)",
+                q,
+                list(bal.keys())[:40],
+            )
+        else:
+            logger.warning("[balance] unexpected fetch_balance type: %s", type(bal))
     return v
+
+
+_logged_first_ok = False
+_logged_balance_dump = False
 
 
 def get_cached_equity_sync(quote: str) -> float | None:
     """Return total balance in *quote* (e.g. USDT for BTC/USDT), cached TTL_S."""
-    global _cache_quote, _cache_val, _cache_ts
+    global _cache_quote, _cache_val, _cache_ts, _logged_first_ok
     now = time.monotonic()
     q = quote.upper()
     with _lock:
@@ -132,4 +174,11 @@ def get_cached_equity_sync(quote: str) -> float | None:
             _cache_val = v
             _cache_quote = q
         # if v is None, still refresh _cache_ts to avoid hammering Bybit every tick
+    if v is not None and not _logged_first_ok:
+        _logged_first_ok = True
+        logger.info(
+            "[balance] OK: total %s in %s (ccxt fetch_balance, same as worker account_equity)",
+            f"{v:.4f}",
+            q,
+        )
     return v
