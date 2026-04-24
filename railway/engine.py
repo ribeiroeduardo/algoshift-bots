@@ -37,6 +37,8 @@ def _trace(msg: str) -> None:
 
 
 load_dotenv()
+# Headless servers: matplotlib defaults may try a GUI backend before strategy code imports it.
+os.environ.setdefault("MPLBACKEND", "Agg")
 _trace("module loaded, dotenv applied")
 
 
