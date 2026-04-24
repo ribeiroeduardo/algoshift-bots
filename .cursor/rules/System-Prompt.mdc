@@ -1,0 +1,98 @@
+---
+description: 
+alwaysApply: true
+---
+
+Use skill /caveman ultra (talk like caveman ultra)
+
+Reply English; ignore user message language.
+
+DB SQL + edge functions: use Supabase CLI. Do not delegate to user what CLI can do (edge deploy, supported ops); run CLI until blocked or human-only step.
+
+When GitHub involved, use GitHub CLI.
+When UI Design involvend, read docs/design/DESIGN.md
+
+Features: own folder, self-contained code; avoid unrelated breaks.
+
+UI: Scrollbars match page style; no native browser scrollbar.
+
+Worktrees — Mandatory Setup
+Git worktrees: agents parallel, isolated branch each.
+
+Problem: No inherited gitignored (.env). No .env → Supabase client null.
+
+On new worktree, run once:
+
+Bash
+bash scripts/setup-worktree.sh
+Symlinks for .env (and .env.local if exists) from main repo into worktree.
+
+GitHub (Workflow)
+Branches: dedicated (feature/…, fix/…, short name). No direct main when PR workflow.
+
+Commits: imperative mood; one subject when possible; #123 / Linear if linked.
+
+Push: git push current branch; no --force on shared/main unless agreed.
+
+PR: what / why / validate (tests, UI steps); screenshots for visuals; tag reviewers.
+
+CI: no merge on red; npm test / tsc before merge when critical.
+
+Review: reply or resolve; push back on fuzzy feedback; tight PR scope. Sub-agent /code-reviewer.
+
+After merge: delete remote branch if policy allows; git pull on base locally.
+
+Stack
+Frontend: React + TypeScript + Vite + Tailwind CSS
+
+Backend: Supabase (Postgres + Auth + Storage + Edge Functions)
+
+Testing: Vitest
+
+Market data: Bybit public Linear/Perp USDT API (klines, tickers; no auth)
+
+AI: OpenRouter (user-configurable models)
+
+About the Project
+AlgoShift: trader web app — journal, AI mentor + market context, imported-trade performance, metrics, curves, Bybit linear + client SMC. Backend Supabase; AI OpenRouter + user model. Less tool split; workflow follows Settings.
+
+Features (Overview)
+Dashboard routes + tabs (/cockpit, /analytics, /performance, /indicadores, /sessoes, /settings/...) — predictable URLs.
+
+auth: login, guards, Supabase callback.
+
+cockpit: daily journal (text, images, timeline, calendar); mentor chat for day; charts + market data per mentor prefs; reflection + context + chat.
+
+/indicadores (Indicators; /smc-teste redirect): market + SMC without journal.
+
+Analytics: aggregates — equity, win rate, avg profit, W/L, time slots, metric cards — trade-utils + shared types.
+
+Performance: calendar table (day/week/month/year); CSV / TradingView import; trade-set detail vs Analytics rollup.
+
+market-data: Bybit klines, tickers, SMC engine (structure, liquidity, FVG, order blocks, …); cockpit reuses modals/flows.
+
+settings: Trading, AI Mentor, SMC Indicators, APIs — risk, mentor model/context, SMC tuning, integrations.
+
+sessions: placeholder tab; future AI summaries; user-facing stub now.
+
+Folder and File Organization for Features
+Domains under src/features/ with components/, hooks/, lib/ when useful; stay consistent inside a feature.
+
+Code used by 2+ features → src/lib/ only when real reuse (types, trade utils, Supabase client).
+
+src/shared/: shell, tooltips, themes — not domain-only rules.
+
+Tests: src/test/ named for module (or colocate if repo moves).
+
+Only cross-import: cockpit → @/features/market-data. No other features/X → features/Y.
+
+Self-Contained Feature Development
+Clear boundary: change mostly inside feature; use @/lib, @/shared downward; no peeking other features except cockpit → market-data.
+
+Minimal public API: export index / stable modules; routes import those; hide hooks/helpers not in contract.
+
+Shared types + rules: src/lib/trade-types, trade-utils, etc. — no dupes.
+
+Side effects / data: props + hooks inside feature; no global tab hack unless lib/ contract says so.
+
+Coordinated changes: shared bit → src/lib/ or flip dependency — keep isolated test/review.

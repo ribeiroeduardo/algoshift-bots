@@ -1,0 +1,4 @@
+supabase==2.3.0
+ccxt==4.1.80
+python-dotenv==1.0.0
+asyncio

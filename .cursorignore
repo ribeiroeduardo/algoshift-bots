@@ -1,0 +1,16 @@
+# Espelha .claudeignore + artefatos comuns para não poluir o índice de contexto
+node_modules/
+venv/
+.git/
+dist/
+build/
+coverage/
+.vite/
+.turbo/
+*.log
+*.lock
+*.tsbuildinfo
+.DS_Store
+_ignore
+.claude
+CLAUDE.md
