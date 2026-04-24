@@ -1,3 +1,5 @@
+# DEPRECATED — use: python -m railway.hub (1 instance) + python -m railway.worker (per BOT_ID).
+# See /railway/PHASE_CRITERIA.md. Monolith kept for local experiments only.
 import os
 import sys
 import inspect
@@ -203,6 +205,17 @@ class RailwayTradingEngine:
                 "enableRateLimit": True,
             }
         )
+        def _flag(n: str) -> bool:
+            return (os.getenv(n) or "").strip().lower() in ("1", "true", "yes")
+
+        use_demo = _flag("BYBIT_USE_DEMO")
+        use_testnet = _flag("BYBIT_USE_TESTNET")
+        if use_demo and use_testnet:
+            raise RuntimeError("set only one: BYBIT_USE_DEMO or BYBIT_USE_TESTNET")
+        if use_demo:
+            self.exchange.enable_demo_trading(True)
+        elif use_testnet:
+            self.exchange.set_sandbox_mode(True)
         _trace("ccxt bybit OK")
         
         self.active_version_id = None
@@ -211,47 +224,45 @@ class RailwayTradingEngine:
         self.start_time = datetime.now()
 
     async def fetch_and_sync_strategy(self):
-        """Load active row from public.strategy_versions (status enum: active)."""
+        """Load active code from public.bots (code_status = active)."""
         try:
-            # Schema: strategy_versions(id, strategy_id, version_number, content, status, ...)
-            # Optional STRATEGY_ID env scopes to one strategy; else newest active by version_number.
-            _trace("fetch_and_sync: query strategy_versions status=active")
-            q = (
-                self.supabase.table("strategy_versions")
-                .select("id, strategy_id, version_number, content, status")
-                .eq("status", "active")
-            )
+            _trace("fetch_and_sync: query bots code_status=active")
+            q = self.supabase.table("bots").select(
+                "id, strategy_id, version_number, content, code_status"
+            ).eq("code_status", "active")
             strategy_id = os.getenv("STRATEGY_ID")
-            if strategy_id:
+            bot_id = os.getenv("BOT_ID")
+            if bot_id:
+                q = q.eq("id", bot_id)
+                _trace(f"fetch_and_sync: filter bot_id={bot_id!r}")
+            elif strategy_id:
                 q = q.eq("strategy_id", strategy_id)
                 _trace(f"fetch_and_sync: filter strategy_id={strategy_id!r}")
             response = q.order("version_number", desc=True).limit(1).execute()
             n = len(response.data or [])
-            _trace(f"fetch_and_sync: rows={n} active_version_id={self.active_version_id!r}")
-            logger.info("Supabase strategy_versions query ok rows=%s", n)
+            _trace(f"fetch_and_sync: rows={n} active_bot_id={self.active_version_id!r}")
+            logger.info("Supabase bots query ok rows=%s", n)
 
             if response.data:
-                version = response.data[0]
-                if version["id"] != self.active_version_id:
+                row = response.data[0]
+                if row["id"] != self.active_version_id:
                     logger.info(
-                        "Nova versao ativa id=%s strategy_id=%s v=%s",
-                        version["id"],
-                        version["strategy_id"],
-                        version["version_number"],
+                        "Nova versao ativa bot_id=%s strategy_id=%s v=%s",
+                        row["id"],
+                        row["strategy_id"],
+                        row["version_number"],
                     )
-                    # Advance active_version_id only after successful compile so missing deps retry each tick.
-                    if self._compile_logic(version["content"], {}):
-                        self.active_version_id = version["id"]
+                    if self._compile_logic(row.get("content") or "", {}):
+                        self.active_version_id = row["id"]
                 else:
-                    _trace("fetch_and_sync: same version id, skip compile")
+                    _trace("fetch_and_sync: same bot id, skip compile")
             else:
                 logger.warning(
-                    "Nenhuma strategy_versions com status=active (STRATEGY_ID set? %s)",
+                    "Nenhum bot com code_status=active (STRATEGY_ID / BOT_ID set? %s / %s)",
                     bool(strategy_id),
+                    bool(bot_id),
                 )
-                _trace(
-                    "fetch_and_sync: empty (table strategy_versions, status active; optional env STRATEGY_ID)"
-                )
+                _trace("fetch_and_sync: empty (bots, code_status active)")
         except Exception as e:
             logger.error(f"Erro ao sincronizar com Supabase: {e}")
             _trace(f"fetch_and_sync EXC: {e!r}")

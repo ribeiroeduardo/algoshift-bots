@@ -3,11 +3,9 @@ description:
 alwaysApply: true
 ---
 
-Use skill /caveman ultra (talk like caveman ultra)
-
 Reply English; ignore user message language.
 
-DB SQL + edge functions: use Supabase CLI. Do not delegate to user what CLI can do (edge deploy, supported ops); run CLI until blocked or human-only step.
+DB SQL + edge functions: use Supabase MCP. Do not delegate to user what MCP can do (edge deploy, supported ops); run MCP until blocked or human-only step.
 
 When GitHub involved, use GitHub CLI.
 When UI Design involvend, read docs/design/DESIGN.md

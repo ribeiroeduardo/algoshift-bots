@@ -31,5 +31,8 @@ if [[ -z "$PYTHON_BIN" ]]; then
   exit 127
 fi
 
-log "exec: PYTHONUNBUFFERED=1 $PYTHON_BIN railway/engine.py"
-exec env PYTHONUNBUFFERED=1 "$PYTHON_BIN" railway/engine.py
+log "exec: PYTHONUNBUFFERED=1 $PYTHON_BIN -m railway.hub (set ENGINE_MONOLITH=1 for legacy engine)"
+if [[ -n "${ENGINE_MONOLITH:-}" ]]; then
+  exec env PYTHONUNBUFFERED=1 "$PYTHON_BIN" railway/engine.py
+fi
+exec env PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m railway.hub
