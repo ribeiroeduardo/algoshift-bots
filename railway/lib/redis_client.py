@@ -2,11 +2,8 @@
 from __future__ import annotations
 
 import os
-import logging
 
 import redis
-
-logger = logging.getLogger(__name__)
 
 
 def _redis_url() -> str:
@@ -26,5 +23,4 @@ def make_redis_client() -> redis.Redis:
         health_check_interval=30,
     )
     client.ping()
-    logger.info("Redis ok host=%s", _redis_url().split("@")[-1].split("/")[0])
     return client

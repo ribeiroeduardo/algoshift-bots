@@ -37,6 +37,8 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - [WORKER] %(message)s", force=True
 )
+for _lg in ("httpx", "httpcore"):
+    logging.getLogger(_lg).setLevel(logging.WARNING)
 logger = logging.getLogger("worker")
 
 FEED_LOG_SEC = float((os.getenv("WORKER_FEED_LOG_SEC") or "30.0").strip() or "30.0")
