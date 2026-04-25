@@ -198,9 +198,15 @@ class StrategyWorker:
         )
         st = (self.bot_row.get("status") or "").lower()
         if st == "error":
-            logger.info(
-                "bot %s -> error: Set to stopped or running in UI, then restart worker.",
+            le = self.bot_row.get("last_error")
+            la = self.bot_row.get("last_error_at")
+            logger.error(
+                "bot %s -> error exit: status=error na DB. last_error_at=%s last_error=%s — "
+                "Defina stopped ou running na UI / Supabase e reinicie. "
+                "(Se não foi o worker: ver logs do hub HUB_MARK_BOT_ERROR / OUTCOME_SUMMARY.)",
                 self.bot_id,
+                la,
+                (str(le)[:2000] if le else "(vazio)"),
             )
             os._exit(0)
 

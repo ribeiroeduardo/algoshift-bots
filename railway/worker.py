@@ -140,9 +140,15 @@ class StrategyWorker:
         )
         st = (self.bot_row.get("status") or "").lower()
         if st == "error":
-            logger.info(
-                "bot %s -> error exit: status=error in DB. Set to stopped or running in Strategies UI / Supabase, then restart worker.",
+            le = self.bot_row.get("last_error")
+            la = self.bot_row.get("last_error_at")
+            logger.error(
+                "bot %s -> error exit: status=error in DB. last_error_at=%s last_error=%s — "
+                "Set to stopped or running in UI / Supabase, then restart. "
+                "(If you did not call mark_error from the worker, check hub logs: HUB_MARK_BOT_ERROR / OUTCOME_SUMMARY.)",
                 self.bot_id,
+                la,
+                (str(le)[:2000] if le else "(empty)"),
             )
             os._exit(0)
         # stopped: keep process up so UI "Start" (status=running) works without redeploy
